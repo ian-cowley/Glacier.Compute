@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <LangVersion>preview</LangVersion>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <NoWarn>$(NoWarn);CS1591;CS8981</NoWarn>
+
+    <!-- NuGet Package Properties -->
+    <PackageId>Glacier.Compute</PackageId>
+    <Version>1.0.0</Version>
+    <Authors>Ian Cowley</Authors>
+    <Company>Glacier High-Performance Ecosystem</Company>
+    <Description>Pure C# .NET 10 In-Memory Shader Bytecode Assembler (PTX 8.0, SPIR-V 1.6, DXBC/DXIL), Multi-Tier VRAM Slab Allocator, and Distributed Ring AllReduce with SIMD Vectorization.</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/ian-cowley/Glacier.Compute</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/ian-cowley/Glacier.Compute.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>compute;cuda;ptx;spirv;dxil;dxbc;vram;allocator;allreduce;nccl;simd;vector512;net10;glacier</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\README.md" Pack="true" PackagePath="\" />
+  </ItemGroup>
+</Project>
