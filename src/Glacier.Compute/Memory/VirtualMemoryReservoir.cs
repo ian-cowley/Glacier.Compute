@@ -31,24 +31,51 @@ public sealed class VirtualMemoryReservoir : IDisposable
     private static extern bool VirtualFree(IntPtr lpAddress, nuint dwSize, uint dwFreeType);
 
     private readonly object _lock = new();
-    private readonly IntPtr _reservedBase;
+    private IntPtr _reservedBase;
     private readonly ulong _totalReservedBytes;
     private ulong _committedOffset;
     private readonly Dictionary<IntPtr, ulong> _committedAllocations = new();
     private bool _disposed;
-    private readonly bool _isWindows;
+    private bool _isWindows;
 
     /// <summary>Gets the total reserved virtual address space capacity in bytes.</summary>
-    public ulong TotalReservedBytes => _totalReservedBytes;
+    public ulong TotalReservedBytes
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _totalReservedBytes;
+        }
+    }
 
     /// <summary>Gets the currently committed memory in bytes.</summary>
     public ulong TotalCommittedBytes
     {
         get
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             lock (_lock)
             {
                 return _committedOffset;
+            }
+        }
+    }
+
+    /// <summary>Gets the currently active allocated memory in bytes.</summary>
+    public ulong ActiveAllocatedBytes
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            lock (_lock)
+            {
+                ulong sum = 0;
+                foreach (var val in _committedAllocations.Values)
+                {
+                    sum += val;
+                }
+
+                return sum;
             }
         }
     }
@@ -59,6 +86,11 @@ public sealed class VirtualMemoryReservoir : IDisposable
     /// <param name="reserveBytes">Total virtual address range to reserve (e.g. 16 GB, default 4 GB).</param>
     public unsafe VirtualMemoryReservoir(ulong reserveBytes = 4UL * 1024 * 1024 * 1024)
     {
+        if (reserveBytes == 0 || reserveBytes > (ulong)nint.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(reserveBytes), "Reserved capacity must be greater than zero and within addressable memory range.");
+        }
+
         _totalReservedBytes = reserveBytes;
         _isWindows = RuntimeInformation.IsOSPlatform(OSPlatform.Windows);
 
@@ -82,6 +114,7 @@ public sealed class VirtualMemoryReservoir : IDisposable
 
     /// <summary>
     /// Commits and maps physical memory for a requested block size from the reserved pool.
+    /// Note: Memory allocation advances an append-only commit watermark across the reserved arena.
     /// </summary>
     public DevicePointer Allocate(ulong byteCount)
     {
@@ -92,14 +125,24 @@ public sealed class VirtualMemoryReservoir : IDisposable
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Allocation size must be greater than zero.");
         }
 
+        if (byteCount > _totalReservedBytes)
+        {
+            throw new ArgumentOutOfRangeException(nameof(byteCount), $"Requested size {byteCount} bytes exceeds total reserved capacity of {_totalReservedBytes} bytes.");
+        }
+
+        if (byteCount > ulong.MaxValue - 65535UL)
+        {
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Requested size causes integer overflow when aligning to page boundary.");
+        }
+
         // Align up to 64 KB page boundary
-        ulong alignedSize = (byteCount + 65535) & ~65535UL;
+        ulong alignedSize = (byteCount + 65535UL) & ~65535UL;
 
         lock (_lock)
         {
             if (_committedOffset + alignedSize > _totalReservedBytes)
             {
-                throw new OutOfMemoryException($"Virtual memory reservoir exhausted: requested {alignedSize} bytes, reserved capacity {_totalReservedBytes} bytes.");
+                throw new OutOfMemoryException($"Virtual memory reservoir exhausted: requested {alignedSize} bytes, committed {_committedOffset} bytes, reserved capacity {_totalReservedBytes} bytes.");
             }
 
             IntPtr address = _reservedBase + (nint)_committedOffset;
@@ -108,7 +151,8 @@ public sealed class VirtualMemoryReservoir : IDisposable
                 IntPtr result = VirtualAlloc(address, (nuint)alignedSize, MEM_COMMIT, PAGE_READWRITE);
                 if (result == IntPtr.Zero)
                 {
-                    throw new OutOfMemoryException($"VirtualAlloc commit failed at address 0x{address:X16} for {alignedSize} bytes.");
+                    int win32Error = Marshal.GetLastWin32Error();
+                    throw new OutOfMemoryException($"VirtualAlloc commit failed at address 0x{address:X16} for {alignedSize} bytes. Win32 error code: {win32Error} (0x{win32Error:X8}).");
                 }
             }
 
@@ -123,7 +167,14 @@ public sealed class VirtualMemoryReservoir : IDisposable
     /// </summary>
     public bool Free(DevicePointer ptr)
     {
-        if (_disposed || ptr.IsNull)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (ptr.IsNull)
+        {
+            return false;
+        }
+
+        if (!Contains(ptr.Address))
         {
             return false;
         }
@@ -137,7 +188,12 @@ public sealed class VirtualMemoryReservoir : IDisposable
 
             if (_isWindows)
             {
-                VirtualFree(ptr.Address, (nuint)size, MEM_DECOMMIT);
+                bool freed = VirtualFree(ptr.Address, (nuint)size, MEM_DECOMMIT);
+                if (!freed)
+                {
+                    int win32Error = Marshal.GetLastWin32Error();
+                    throw new InvalidOperationException($"VirtualFree decommit failed at address 0x{ptr.Address:X16} for {size} bytes. Win32 error code: {win32Error} (0x{win32Error:X8}).");
+                }
             }
 
             return true;
@@ -149,6 +205,12 @@ public sealed class VirtualMemoryReservoir : IDisposable
     /// </summary>
     public bool Contains(IntPtr address)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (address == IntPtr.Zero || _reservedBase == IntPtr.Zero)
+        {
+            return false;
+        }
+
         nint diff = address - _reservedBase;
         return diff >= 0 && diff < (nint)_totalReservedBytes;
     }
@@ -158,19 +220,26 @@ public sealed class VirtualMemoryReservoir : IDisposable
     {
         if (!_disposed)
         {
-            _disposed = true;
             lock (_lock)
             {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
                 _committedAllocations.Clear();
-                if (_reservedBase != IntPtr.Zero)
+                IntPtr basePtr = _reservedBase;
+                _reservedBase = IntPtr.Zero;
+                if (basePtr != IntPtr.Zero)
                 {
                     if (_isWindows)
                     {
-                        VirtualFree(_reservedBase, 0, MEM_RELEASE);
+                        VirtualFree(basePtr, 0, MEM_RELEASE);
                     }
                     else
                     {
-                        NativeMemory.AlignedFree((void*)_reservedBase);
+                        NativeMemory.AlignedFree((void*)basePtr);
                     }
                 }
             }

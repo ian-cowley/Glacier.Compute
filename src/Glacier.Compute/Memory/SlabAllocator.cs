@@ -29,6 +29,11 @@ public sealed class SlabAllocator : IDisposable
     /// <param name="slotsPerBin">Number of fixed-size slots per bin (must be multiple of 64).</param>
     public SlabAllocator(int slotsPerBin = 1024)
     {
+        if (slotsPerBin > (int.MaxValue / 65536))
+        {
+            throw new ArgumentOutOfRangeException(nameof(slotsPerBin), "Slots per bin exceeds allowable memory capacity.");
+        }
+
         if (slotsPerBin <= 0 || (slotsPerBin % 64) != 0)
         {
             slotsPerBin = 1024;
@@ -64,7 +69,7 @@ public sealed class SlabAllocator : IDisposable
             }
         }
 
-        throw new OutOfMemoryException($"SlabAllocator exhausted for requested size {byteCount} bytes.");
+        throw new OutOfMemoryException($"SlabAllocator exhausted for requested size {byteCount} bytes. Active allocated: {ActiveAllocatedBytes} bytes, Total committed: {TotalCommittedBytes} bytes.");
     }
 
     /// <summary>
@@ -72,7 +77,9 @@ public sealed class SlabAllocator : IDisposable
     /// </summary>
     public bool Free(DevicePointer ptr)
     {
-        if (_disposed || ptr.IsNull)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (ptr.IsNull)
         {
             return false;
         }
@@ -93,6 +100,12 @@ public sealed class SlabAllocator : IDisposable
     /// </summary>
     public bool Contains(IntPtr address)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (address == IntPtr.Zero)
+        {
+            return false;
+        }
+
         for (int i = 0; i < _bins.Length; i++)
         {
             if (_bins[i].Contains(address))
@@ -108,6 +121,7 @@ public sealed class SlabAllocator : IDisposable
     {
         get
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ulong total = 0;
             for (int i = 0; i < _bins.Length; i++)
             {
@@ -122,6 +136,7 @@ public sealed class SlabAllocator : IDisposable
     {
         get
         {
+            ObjectDisposedException.ThrowIf(_disposed, this);
             ulong total = 0;
             for (int i = 0; i < _bins.Length; i++)
             {
@@ -152,9 +167,10 @@ public sealed class SlabAllocator : IDisposable
         public readonly int SlotSize;
         public readonly int SlotCount;
         public readonly ulong TotalBytes;
-        private readonly IntPtr _baseAddress;
+        private IntPtr _baseAddress;
         private readonly long[] _bitmasks; // 0 = free, 1 = occupied
         private int _allocatedCount;
+        private bool _disposed;
 
         public ulong AllocatedBytes => (ulong)_allocatedCount * (ulong)SlotSize;
 
@@ -174,12 +190,23 @@ public sealed class SlabAllocator : IDisposable
 
         public bool Contains(IntPtr address)
         {
+            if (_disposed || address == IntPtr.Zero || _baseAddress == IntPtr.Zero)
+            {
+                return false;
+            }
+
             nint diff = address - _baseAddress;
             return diff >= 0 && diff < (nint)TotalBytes;
         }
 
         public bool TryAllocate(out IntPtr ptr)
         {
+            if (_disposed || _baseAddress == IntPtr.Zero)
+            {
+                ptr = IntPtr.Zero;
+                return false;
+            }
+
             for (int wordIdx = 0; wordIdx < _bitmasks.Length; wordIdx++)
             {
                 while (true)
@@ -212,6 +239,11 @@ public sealed class SlabAllocator : IDisposable
 
         public bool Free(IntPtr address)
         {
+            if (_disposed || _baseAddress == IntPtr.Zero)
+            {
+                return false;
+            }
+
             nint diff = address - _baseAddress;
             if (diff < 0 || diff >= (nint)TotalBytes || (diff % SlotSize) != 0)
             {
@@ -243,9 +275,14 @@ public sealed class SlabAllocator : IDisposable
 
         public void Dispose()
         {
-            if (_baseAddress != IntPtr.Zero)
+            if (!_disposed)
             {
-                NativeMemory.AlignedFree((void*)_baseAddress);
+                _disposed = true;
+                IntPtr baseAddr = Interlocked.Exchange(ref _baseAddress, IntPtr.Zero);
+                if (baseAddr != IntPtr.Zero)
+                {
+                    NativeMemory.AlignedFree((void*)baseAddr);
+                }
             }
         }
     }

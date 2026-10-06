@@ -27,14 +27,35 @@ public sealed class BuddyAllocator : IDisposable
     public const int OrderCount = 9;
 
     private readonly object _lock = new();
-    private readonly IntPtr _arenaBase;
+    private IntPtr _arenaBase;
     private readonly ulong _arenaSize;
     private readonly HashSet<ulong>[] _freeLists;
     private readonly Dictionary<IntPtr, (ulong Offset, int Order)> _allocatedBlocks;
+    private ulong _allocatedBytes;
     private bool _disposed;
 
     /// <summary>Gets the total size of the buddy arena in bytes.</summary>
-    public ulong TotalCapacity => _arenaSize;
+    public ulong TotalCapacity
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _arenaSize;
+        }
+    }
+
+    /// <summary>Gets the currently allocated memory in bytes.</summary>
+    public ulong AllocatedBytes
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            lock (_lock)
+            {
+                return _allocatedBytes;
+            }
+        }
+    }
 
     /// <summary>
     /// Initializes a new instance of the <see cref="BuddyAllocator"/> class.
@@ -42,6 +63,11 @@ public sealed class BuddyAllocator : IDisposable
     /// <param name="arenaSizeBytes">Total capacity in bytes (must be a multiple of MaxBlockSize, default 64 MB).</param>
     public unsafe BuddyAllocator(ulong arenaSizeBytes = MaxBlockSize * 2)
     {
+        if (arenaSizeBytes > (ulong)nint.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(arenaSizeBytes), "Arena size exceeds addressable memory range.");
+        }
+
         if (arenaSizeBytes < MaxBlockSize || (arenaSizeBytes % MaxBlockSize) != 0)
         {
             arenaSizeBytes = MaxBlockSize * 2;
@@ -73,6 +99,11 @@ public sealed class BuddyAllocator : IDisposable
     /// </summary>
     public static int GetOrderForSize(ulong byteCount)
     {
+        if (byteCount == 0)
+        {
+            throw new ArgumentOutOfRangeException(nameof(byteCount), "Requested size must be greater than zero.");
+        }
+
         if (byteCount <= MinBlockSize)
         {
             return 0;
@@ -96,7 +127,15 @@ public sealed class BuddyAllocator : IDisposable
     /// <summary>
     /// Returns the block byte size for a given order.
     /// </summary>
-    public static ulong GetBlockSize(int order) => MinBlockSize << order;
+    public static ulong GetBlockSize(int order)
+    {
+        if (order < 0 || order >= OrderCount)
+        {
+            throw new ArgumentOutOfRangeException(nameof(order), order, $"Buddy order must be between 0 and {OrderCount - 1}.");
+        }
+
+        return MinBlockSize << order;
+    }
 
     /// <summary>
     /// Allocates a contiguous block of device memory for the given byte size.
@@ -124,7 +163,7 @@ public sealed class BuddyAllocator : IDisposable
 
             if (currentOrder >= OrderCount)
             {
-                throw new OutOfMemoryException($"BuddyAllocator arena exhausted. Cannot satisfy {byteCount} bytes (Order {targetOrder}).");
+                throw new OutOfMemoryException($"BuddyAllocator arena exhausted. Cannot satisfy {byteCount} bytes (Order {targetOrder}). Total capacity: {_arenaSize} bytes, Allocated: {_allocatedBytes} bytes, Active blocks: {_allocatedBlocks.Count}.");
             }
 
             // Pop a block from currentOrder
@@ -144,6 +183,7 @@ public sealed class BuddyAllocator : IDisposable
 
             IntPtr address = _arenaBase + (nint)blockOffset;
             _allocatedBlocks[address] = (blockOffset, targetOrder);
+            _allocatedBytes += allocatedSize;
 
             return new DevicePointer(address, allocatedSize);
         }
@@ -154,7 +194,14 @@ public sealed class BuddyAllocator : IDisposable
     /// </summary>
     public bool Free(DevicePointer ptr)
     {
-        if (_disposed || ptr.IsNull)
+        ObjectDisposedException.ThrowIf(_disposed, this);
+
+        if (ptr.IsNull)
+        {
+            return false;
+        }
+
+        if (!Contains(ptr.Address))
         {
             return false;
         }
@@ -168,6 +215,8 @@ public sealed class BuddyAllocator : IDisposable
 
             ulong blockOffset = metadata.Offset;
             int order = metadata.Order;
+            ulong allocatedSize = GetBlockSize(order);
+            _allocatedBytes -= allocatedSize;
 
             // Coalesce buddies recursively
             while (order < OrderCount - 1)
@@ -199,6 +248,12 @@ public sealed class BuddyAllocator : IDisposable
     /// </summary>
     public bool Contains(IntPtr address)
     {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (address == IntPtr.Zero || _arenaBase == IntPtr.Zero)
+        {
+            return false;
+        }
+
         nint diff = address - _arenaBase;
         return diff >= 0 && diff < (nint)_arenaSize;
     }
@@ -208,17 +263,26 @@ public sealed class BuddyAllocator : IDisposable
     {
         if (!_disposed)
         {
-            _disposed = true;
             lock (_lock)
             {
+                if (_disposed)
+                {
+                    return;
+                }
+
+                _disposed = true;
                 _allocatedBlocks.Clear();
+                _allocatedBytes = 0;
                 for (int i = 0; i < OrderCount; i++)
                 {
                     _freeLists[i].Clear();
                 }
-                if (_arenaBase != IntPtr.Zero)
+
+                IntPtr basePtr = _arenaBase;
+                _arenaBase = IntPtr.Zero;
+                if (basePtr != IntPtr.Zero)
                 {
-                    NativeMemory.AlignedFree((void*)_arenaBase);
+                    NativeMemory.AlignedFree((void*)basePtr);
                 }
             }
         }
