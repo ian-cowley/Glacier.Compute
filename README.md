@@ -182,6 +182,13 @@ python scripts/security_check.py Glacier.Compute
 
 ---
 
-## 7. License
+## 7. 🆕 What's New in v1.0.4
+
+- **Unmanaged Memory Allocator Fortification** — Hardened `BuddyAllocator`, `SlabAllocator`, and `VirtualMemoryReservoir` with strict parameter bounds checking, `ObjectDisposedException.ThrowIf` disposal guards, integer overflow protection, and Win32 error code capture (`Marshal.GetLastWin32Error()`).
+- **60 unit tests** passing (100% green).
+
+---
+
+## 8. License
 
 Licensed under the [MIT License](LICENSE).
