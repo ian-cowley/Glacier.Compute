@@ -1,3 +1,5 @@
+![Glacier.Compute Banner](assets/banner.jpg)
+
 # ⚡ Glacier.Compute
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -25,6 +27,10 @@ Modern GPU acceleration and distributed machine learning in .NET are traditional
 ---
 
 ## 2. Architecture & Subsystem Topology
+
+<p align="center">
+  <img src="assets/architecture.jpg" alt="Glacier.Compute Architecture Blueprint" width="100%" />
+</p>
 
 ```
                               Glacier.Compute Pipeline
