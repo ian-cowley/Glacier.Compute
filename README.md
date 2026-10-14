@@ -195,6 +195,12 @@ python scripts/security_check.py Glacier.Compute
 
 ---
 
+## Credits
+
+Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
+
+---
+
 ## 8. License
 
-Licensed under the [MIT License](LICENSE).
+Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
