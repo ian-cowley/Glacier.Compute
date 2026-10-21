@@ -6,6 +6,8 @@
 [![.NET 10](https://img.shields.io/badge/.NET-10.0-purple.svg)](https://dotnet.microsoft.com/)
 [![Zero External Dependencies](https://img.shields.io/badge/Dependencies-Zero-brightgreen.svg)]()
 [![Pure C#](https://img.shields.io/badge/Implementation-100%25%20Pure%20C%23-blueviolet.svg)]()
+[![Website](https://img.shields.io/badge/Website-glaciersoftware.dev-66fcf1.svg)](https://glaciersoftware.dev/)
+[![Buy Me A Coffee](https://img.shields.io/badge/Buy%20Me%20A%20Coffee-Support-orange.svg?logo=buy-me-a-coffee)](https://buymeacoffee.com/glaciersoftware)
 
 > **Pillar 13 of the Glacier High-Performance Ecosystem**  
 > Pure C# .NET 10 In-Memory Shader Bytecode Assembler (PTX 8.0, SPIR-V 1.6, DXBC/DXIL), Unified Multi-Tier VRAM Allocator, and Distributed Ring AllReduce with SIMD Vectorization.
@@ -204,3 +206,14 @@ Developed by **Ian Cowley** and **Antigravity (Google DeepMind)**.
 ## 8. License
 
 Licensed under the [MIT License](LICENSE). Copyright (c) 2026 Ian Cowley.
+
+---
+
+## ❄️ Glacier Ecosystem & Support
+
+Part of the **[Glacier Ecosystem](https://glaciersoftware.dev/)** — high-performance, zero-allocation developer tooling and data engines natively built for modern C# and .NET 10.
+
+* 🌐 **Website & Documentation**: [glaciersoftware.dev](https://glaciersoftware.dev/)
+* ☕ **Buy Me a Coffee**: [buymeacoffee.com/glaciersoftware](https://buymeacoffee.com/glaciersoftware)
+* ❤️ **GitHub Sponsors**: [github.com/sponsors/ian-cowley](https://github.com/sponsors/ian-cowley)
+* 🐙 **All Repositories**: [github.com/ian-cowley](https://github.com/ian-cowley)
