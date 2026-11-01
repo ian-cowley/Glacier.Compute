@@ -11,8 +11,10 @@ using System.IO;
 using System.Security.Cryptography;
 
 /// <summary>
-/// Direct pure C# DirectX Container (DXBC) builder for Direct3D 12 compute pipelines.
-/// Assembles container chunks and computes container checksums without external toolchains.
+/// Pure C# DirectX Container (DXBC) packager for precompiled shader chunks and container inspection.
+/// Note: Retail D3D12 execution of SM 6.0+ DXIL requires external <c>dxil.dll</c> validator signing unless
+/// D3D12 experimental shader models Developer Mode is active; this builder writes an unsigned MD5 digest
+/// over container payload bytes (<c>offset 20..end</c>) for structural integrity checks.
 /// </summary>
 public sealed class DxbcContainerBuilder
 {
@@ -41,19 +43,11 @@ public sealed class DxbcContainerBuilder
             throw new InvalidOperationException("Cannot build DXBC container with zero chunks.");
         }
 
-        // Header size:
-        // 4 bytes: Magic 'DXBC'
-        // 16 bytes: MD5 / Hash digest
-        // 4 bytes: Version (1)
-        // 4 bytes: TotalSize
-        // 4 bytes: ChunkCount
-        // ChunkCount * 4 bytes: Chunk offsets
         int headerSize = 32 + (_chunks.Count * 4);
 
         int totalSize = headerSize;
         for (int i = 0; i < _chunks.Count; i++)
         {
-            // Each chunk has 4 bytes FourCC + 4 bytes Size + Data
             totalSize += 8 + _chunks[i].Data.Length;
         }
 
@@ -64,7 +58,7 @@ public sealed class DxbcContainerBuilder
         // 1. Magic 'DXBC'
         writer.Write(MagicFourCc);
 
-        // 2. Placeholder for 16-byte checksum (offsets 4..19)
+        // 2. Placeholder for 16-byte digest (offsets 4..19)
         writer.Write(new byte[16]);
 
         // 3. Version (1)
@@ -93,28 +87,42 @@ public sealed class DxbcContainerBuilder
             writer.Write(chunk.Data);
         }
 
-        // 8. Compute MD5 checksum over container (excluding checksum field itself)
-        byte[] hash = MD5.HashData(buffer.AsSpan(20)); // Hash from byte 20 onwards
-        Array.Copy(hash, 0, buffer, 4, 16);
+        // 8. Compute unsigned integrity digest over container body (byte 20 onwards)
+        MD5.HashData(buffer.AsSpan(20), buffer.AsSpan(4, 16));
 
         return buffer;
     }
 
     /// <summary>
-    /// Helper to assemble a complete compute shader DXBC container with DXIL and PSV0 chunks.
+    /// Quarantined entry point: throws <see cref="NotSupportedException"/> because direct LLVM 3.7 DXIL synthesis
+    /// from <see cref="Instruction"/> streams requires external DXC compilation and <c>dxil.dll</c> signing.
+    /// Use <see cref="PackagePrecompiledShader"/> to package precompiled LLVM bitcode blobs.
     /// </summary>
+    /// <exception cref="NotSupportedException">Always thrown.</exception>
     public static ReadOnlyMemory<byte> BuildComputeShader(ShaderStage stage, ReadOnlySpan<Instruction> instructions)
     {
-        var builder = new DxbcContainerBuilder();
-
-        // 1. DXIL chunk
         var dxilChunk = DxilChunkEmitter.CreateDxilChunk(stage, instructions);
-        builder.AddChunk(dxilChunk);
-
-        // 2. PSV0 chunk
         var psv0Chunk = DxilChunkEmitter.CreatePsv0Chunk(stage, threadsX: 64, threadsY: 1, threadsZ: 1);
-        builder.AddChunk(psv0Chunk);
 
+        var builder = new DxbcContainerBuilder();
+        builder.AddChunk(dxilChunk);
+        builder.AddChunk(psv0Chunk);
+        return builder.Build();
+    }
+
+    /// <summary>
+    /// Packages a precompiled LLVM 3.7 DXIL bitcode blob and PSV0 metadata chunk into a DXBC container.
+    /// </summary>
+    public static ReadOnlyMemory<byte> PackagePrecompiledShader(
+        ShaderStage stage,
+        ReadOnlySpan<byte> precompiledBitcode,
+        uint threadsX = 64,
+        uint threadsY = 1,
+        uint threadsZ = 1)
+    {
+        var builder = new DxbcContainerBuilder();
+        builder.AddChunk(DxilChunkEmitter.CreateDxilChunkFromBitcode(stage, precompiledBitcode));
+        builder.AddChunk(DxilChunkEmitter.CreatePsv0Chunk(stage, threadsX, threadsY, threadsZ));
         return builder.Build();
     }
 }

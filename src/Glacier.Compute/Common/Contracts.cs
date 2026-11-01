@@ -43,7 +43,7 @@ public enum ReductionOp : byte
 }
 
 /// <summary>
-/// Memory tier classification for multi-tier VRAM allocation.
+/// Memory tier classification for multi-tier arena sub-allocation.
 /// </summary>
 public enum MemoryCategory : byte
 {
@@ -53,35 +53,38 @@ public enum MemoryCategory : byte
     /// <summary>Tier 2: Buddy power-of-two blocks (128 KB – 32 MB).</summary>
     BuddyMedium = 1,
 
-    /// <summary>Tier 3: Virtual address reservoir (> 32 MB).</summary>
+    /// <summary>Tier 3: Large virtual address reservoir or tail arena (&gt; 32 MB).</summary>
     LargeVirtual = 2
 }
 
 /// <summary>
-/// Represents a pointer to device VRAM or pinned host memory with explicit byte size.
+/// Represents a typed sub-allocated slice address within an external device arena (CUDA/D3D12/Vulkan VRAM or pinned memory)
+/// or an aligned unmanaged host arena, paired with its explicit byte capacity.
 /// </summary>
-/// <param name="Address">The native device address or pointer.</param>
+/// <param name="Address">The native device virtual address or unmanaged host pointer.</param>
 /// <param name="SizeInBytes">The capacity in bytes of the allocated region.</param>
 public readonly record struct DevicePointer(IntPtr Address, ulong SizeInBytes)
 {
-    /// <summary>Gets a value indicating whether this device pointer is null or zero.</summary>
+    /// <summary>Gets a value indicating whether this pointer is null or zero-sized.</summary>
     public bool IsNull => Address == IntPtr.Zero || SizeInBytes == 0;
 
-    /// <summary>Returns a null device pointer.</summary>
+    /// <summary>Returns a null pointer.</summary>
     public static DevicePointer Null => new(IntPtr.Zero, 0);
 }
 
 /// <summary>
 /// Low-level compute instruction representation.
 /// </summary>
-/// <param name="Opcode">The numeric operation code.</param>
+/// <param name="Opcode">The numeric operation code (<see cref="Assembler.ComputeOpcode"/>).</param>
 /// <param name="OperandA">The first operand register or literal index.</param>
 /// <param name="OperandB">The second operand register or literal index.</param>
 /// <param name="Destination">The target destination register index.</param>
 public readonly record struct Instruction(int Opcode, int OperandA, int OperandB, int Destination);
 
 /// <summary>
-/// Builder contract for in-memory shader bytecode assembler across PTX, SPIR-V, and DXIL/DXBC.
+/// Builder contract for in-memory shader bytecode emission across PTX 8.0 and SPIR-V 1.6.
+/// Direct LLVM 3.7 DXIL emission from <see cref="Instruction"/> streams is quarantined because retail D3D12 drivers
+/// require external DXC compilation and <c>dxil.dll</c> validator signing.
 /// </summary>
 public interface IShaderBytecodeBuilder
 {
@@ -91,7 +94,9 @@ public interface IShaderBytecodeBuilder
     ReadOnlyMemory<byte> BuildSpirV(ShaderStage stage, ReadOnlySpan<Instruction> instructions);
 
     /// <summary>
-    /// Builds a DirectX Container (DXBC) containing DXIL bitcode for Direct3D 12.
+    /// Builds a DirectX Container (DXBC) containing DXIL bitcode for Direct3D 12, if supported by the implementation.
+    /// The default pure-C# builder throws <see cref="NotSupportedException"/> because retail D3D12 drivers reject unsigned
+    /// non-DXC LLVM 3.7 bitcode; use <see cref="Assembler.Dxbc.DxbcContainerBuilder.PackagePrecompiledShader"/> for precompiled blobs.
     /// </summary>
     ReadOnlyMemory<byte> BuildDxil(ShaderStage stage, ReadOnlySpan<Instruction> instructions);
 
@@ -102,22 +107,23 @@ public interface IShaderBytecodeBuilder
 }
 
 /// <summary>
-/// Multi-tier unified VRAM allocator contract.
+/// Multi-tier arena sub-allocator contract capable of managing either caller-supplied GPU VRAM / pinned device arenas
+/// (e.g. <c>cuMemAlloc</c>, <c>cuMemHostAlloc</c>, <c>ID3D12Heap</c>) or standalone unmanaged host memory arenas.
 /// </summary>
 public interface IVramAllocator : IDisposable
 {
     /// <summary>
-    /// Allocates memory of the requested size and category.
+    /// Sub-allocates memory of the requested size and category from the backing arena.
     /// </summary>
     DevicePointer Allocate(ulong byteCount, MemoryCategory category);
 
     /// <summary>
-    /// Frees an allocated device pointer.
+    /// Frees an allocated arena slice.
     /// </summary>
     void Free(DevicePointer ptr);
 
     /// <summary>
-    /// Rents a temporary scratch workspace from the stream ring buffer.
+    /// Rents a temporary scratch workspace from the circular ring buffer.
     /// </summary>
     ScratchWorkspace RentScratchWorkspace(ulong minimumBytes);
 }
@@ -140,7 +146,7 @@ public interface IDistributedContext : IDisposable
 }
 
 /// <summary>
-/// High-speed scoped scratch workspace rented from the per-stream circular ring buffer.
+/// High-speed scoped scratch workspace rented from a circular ring buffer.
 /// Disposing returns the slice to the allocator without driver overhead.
 /// </summary>
 public readonly ref struct ScratchWorkspace

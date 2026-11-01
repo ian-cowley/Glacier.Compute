@@ -6,6 +6,7 @@
 namespace Glacier.Compute.Benchmarks;
 
 using System;
+using System.Buffers.Binary;
 using BenchmarkDotNet.Attributes;
 using Glacier.Compute;
 using Glacier.Compute.Assembler;
@@ -18,6 +19,7 @@ using Glacier.Compute.Pipeline;
 public class AssemblerBenchmarks
 {
     private Instruction[] _instructions = null!;
+    private byte[] _precompiledBitcode = null!;
     private SpirvBinaryEmitter _spirvEmitter = null!;
     private uint[] _spirvWordBuffer = null!;
     private ShaderPipeline _pipeline = null!;
@@ -30,6 +32,9 @@ public class AssemblerBenchmarks
         {
             _instructions[i] = new Instruction((int)ComputeOpcode.Add, i, (i + 1) % 32, (i + 2) % 32);
         }
+
+        _precompiledBitcode = new byte[64];
+        BinaryPrimitives.WriteUInt32LittleEndian(_precompiledBitcode.AsSpan(0, 4), DxilChunkEmitter.LlvmBitcodeMagic);
 
         _spirvEmitter = new SpirvBinaryEmitter();
         _spirvWordBuffer = new uint[2048];
@@ -55,9 +60,9 @@ public class AssemblerBenchmarks
     }
 
     [Benchmark]
-    public ReadOnlyMemory<byte> EmitDxbcContainer()
+    public ReadOnlyMemory<byte> PackageDxbcContainer()
     {
-        return DxbcContainerBuilder.BuildComputeShader(ShaderStage.Compute, _instructions);
+        return DxbcContainerBuilder.PackagePrecompiledShader(ShaderStage.Compute, _precompiledBitcode);
     }
 
     [Benchmark]

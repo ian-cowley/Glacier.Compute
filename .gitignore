@@ -5,5 +5,13 @@ obj/
 .vs/
 TestResults/
 BenchmarkDotNet.Artifacts/
+packages/
+*.nupkg
+*.snupkg
 PROJECT_SOURCE.md
 Glacier.Compute.md
+
+# Secrets & local configuration (Zero Secrets Policy)
+appsettings*.json
+!appsettings.template.json
+*.env*

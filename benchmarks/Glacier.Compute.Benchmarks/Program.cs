@@ -6,6 +6,7 @@
 namespace Glacier.Compute.Benchmarks;
 
 using System;
+using System.Buffers.Binary;
 using System.Diagnostics;
 using System.Threading.Tasks;
 using BenchmarkDotNet.Running;
@@ -54,6 +55,9 @@ public static class Program
             instructions[i] = new Instruction((int)ComputeOpcode.Add, i, (i + 1) % 32, (i + 2) % 32);
         }
 
+        byte[] precompiledBitcode = new byte[64];
+        BinaryPrimitives.WriteUInt32LittleEndian(precompiledBitcode.AsSpan(0, 4), DxilChunkEmitter.LlvmBitcodeMagic);
+
         var spirvEmitter = new SpirvBinaryEmitter();
         var pipeline = new ShaderPipeline();
 
@@ -62,7 +66,7 @@ public static class Program
         {
             _ = PtxEmitter.Emit(instructions);
             _ = spirvEmitter.EmitModule(ShaderStage.Compute, instructions);
-            _ = DxbcContainerBuilder.BuildComputeShader(ShaderStage.Compute, instructions);
+            _ = DxbcContainerBuilder.PackagePrecompiledShader(ShaderStage.Compute, precompiledBitcode);
             _ = pipeline.Compile("w", ShaderStage.Compute, instructions);
         }
 
@@ -73,7 +77,7 @@ public static class Program
             _ = PtxEmitter.Emit(instructions);
         }
         sw.Stop();
-        double ptxNs = (sw.Elapsed.TotalNanoseconds) / iterations;
+        double ptxNs = sw.Elapsed.TotalNanoseconds / iterations;
         Console.WriteLine($"  [PTX 8.0 JIT Generator]       : {ptxNs:F2} ns / kernel ({1_000_000.0 / ptxNs:F2}K ops/sec)");
 
         sw.Restart();
@@ -82,17 +86,17 @@ public static class Program
             _ = spirvEmitter.EmitModule(ShaderStage.Compute, instructions);
         }
         sw.Stop();
-        double spirvNs = (sw.Elapsed.TotalNanoseconds) / iterations;
+        double spirvNs = sw.Elapsed.TotalNanoseconds / iterations;
         Console.WriteLine($"  [SPIR-V 1.6 Binary Emitter]   : {spirvNs:F2} ns / module ({1_000_000.0 / spirvNs:F2}K ops/sec)");
 
         sw.Restart();
         for (int i = 0; i < iterations; i++)
         {
-            _ = DxbcContainerBuilder.BuildComputeShader(ShaderStage.Compute, instructions);
+            _ = DxbcContainerBuilder.PackagePrecompiledShader(ShaderStage.Compute, precompiledBitcode);
         }
         sw.Stop();
-        double dxbcNs = (sw.Elapsed.TotalNanoseconds) / iterations;
-        Console.WriteLine($"  [DXBC/DXIL Container Builder] : {dxbcNs:F2} ns / container ({1_000_000.0 / dxbcNs:F2}K ops/sec)");
+        double dxbcNs = sw.Elapsed.TotalNanoseconds / iterations;
+        Console.WriteLine($"  [DXBC Container Packager]     : {dxbcNs:F2} ns / container ({1_000_000.0 / dxbcNs:F2}K ops/sec)");
 
         sw.Restart();
         for (int i = 0; i < iterations; i++)
@@ -100,12 +104,12 @@ public static class Program
             _ = pipeline.Compile("cached", ShaderStage.Compute, instructions);
         }
         sw.Stop();
-        double pipelineNs = (sw.Elapsed.TotalNanoseconds) / iterations;
+        double pipelineNs = sw.Elapsed.TotalNanoseconds / iterations;
         Console.WriteLine($"  [Pipeline Cached JIT Lookup]  : {pipelineNs:F2} ns / lookup ({1_000_000.0 / pipelineNs:F2}K ops/sec)");
 
         Console.WriteLine();
         Console.WriteLine("-------------------------------------------------------------------------------");
-        Console.WriteLine("2. Unified Multi-Tier VRAM Allocator Latency");
+        Console.WriteLine("2. Multi-Tier Arena Sub-Allocator Latency");
         Console.WriteLine("-------------------------------------------------------------------------------");
 
         using var slab = new SlabAllocator(slotsPerBin: 1024);
@@ -130,7 +134,7 @@ public static class Program
             slab.Free(p);
         }
         sw.Stop();
-        double slabNs = (sw.Elapsed.TotalNanoseconds) / allocIters;
+        double slabNs = sw.Elapsed.TotalNanoseconds / allocIters;
         Console.WriteLine($"  [Tier 1: Slab Alloc + Free]   : {slabNs:F2} ns / cycle (0 driver calls)");
 
         sw.Restart();
@@ -140,7 +144,7 @@ public static class Program
             buddy.Free(p);
         }
         sw.Stop();
-        double buddyNs = (sw.Elapsed.TotalNanoseconds) / allocIters;
+        double buddyNs = sw.Elapsed.TotalNanoseconds / allocIters;
         Console.WriteLine($"  [Tier 2: Buddy Alloc + Merge] : {buddyNs:F2} ns / cycle (zero fragmentation)");
 
         sw.Restart();
@@ -149,8 +153,8 @@ public static class Program
             _ = ring.Allocate(4096);
         }
         sw.Stop();
-        double ringNs = (sw.Elapsed.TotalNanoseconds) / allocIters;
-        Console.WriteLine($"  [Stream Scratch Pointer Bump] : {ringNs:F2} ns / bump (lock-free atomic)");
+        double ringNs = sw.Elapsed.TotalNanoseconds / allocIters;
+        Console.WriteLine($"  [Stream Scratch Pointer Bump] : {ringNs:F2} ns / bump (lock-free CAS)");
 
         Console.WriteLine();
         Console.WriteLine("-------------------------------------------------------------------------------");
@@ -176,7 +180,7 @@ public static class Program
             SimdAccumulator.Accumulate(dst, src, ReductionOp.Sum);
         }
         sw.Stop();
-        double simdUs = (sw.Elapsed.TotalMicroseconds) / simdIters;
+        double simdUs = sw.Elapsed.TotalMicroseconds / simdIters;
         double throughputGbps = ((double)tensorSize * sizeof(float) * 2 / 1e9) / (simdUs / 1e6);
         Console.WriteLine($"  [SIMD Vector Accumulate 64K]  : {simdUs:F2} μs ({throughputGbps:F2} GB/s bandwidth)");
 
@@ -200,7 +204,7 @@ public static class Program
             await DistributedAllReduce.ExecuteClusterAsync(cluster4, buffers4, ReductionOp.Sum);
         }
         sw.Stop();
-        double ringMs = (sw.Elapsed.TotalMilliseconds) / ringIters;
+        double ringMs = sw.Elapsed.TotalMilliseconds / ringIters;
         Console.WriteLine($"  [Ring AllReduce 4-Node 256KB] : {ringMs:F3} ms / step");
         Console.WriteLine("===============================================================================");
     }

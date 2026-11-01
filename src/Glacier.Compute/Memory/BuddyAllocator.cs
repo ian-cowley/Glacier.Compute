@@ -11,9 +11,10 @@ using System.Numerics;
 using System.Runtime.InteropServices;
 
 /// <summary>
-/// Tier 2: Buddy Power-of-Two Allocator (128 KB – 32 MB).
-/// Manages intermediate activation buffers, gradient tensors, and convolution maps.
-/// Guarantees zero external fragmentation by recursively merging companion buddies on free.
+/// Tier 2: Buddy Power-of-Two Sub-Allocator (128 KB – 32 MB).
+/// Manages intermediate activation buffers, gradient tensors, and convolution maps over either caller-supplied
+/// GPU/pinned arenas (e.g. <c>cuMemAlloc</c>, <c>cuMemHostAlloc</c>, <c>D3D12</c>) or unmanaged host arenas.
+/// Guarantees zero external fragmentation by recursively merging companion buddies on free without touching arena memory on the CPU.
 /// </summary>
 public sealed class BuddyAllocator : IDisposable
 {
@@ -29,10 +30,22 @@ public sealed class BuddyAllocator : IDisposable
     private readonly object _lock = new();
     private IntPtr _arenaBase;
     private readonly ulong _arenaSize;
+    private readonly bool _ownsHostMemory;
+    private readonly Action<IntPtr>? _releaseAction;
     private readonly HashSet<ulong>[] _freeLists;
     private readonly Dictionary<IntPtr, (ulong Offset, int Order)> _allocatedBlocks;
     private ulong _allocatedBytes;
     private bool _disposed;
+
+    /// <summary>Gets the base native or device address of the buddy arena.</summary>
+    public IntPtr BaseAddress
+    {
+        get
+        {
+            ObjectDisposedException.ThrowIf(_disposed, this);
+            return _arenaBase;
+        }
+    }
 
     /// <summary>Gets the total size of the buddy arena in bytes.</summary>
     public ulong TotalCapacity
@@ -58,40 +71,78 @@ public sealed class BuddyAllocator : IDisposable
     }
 
     /// <summary>
-    /// Initializes a new instance of the <see cref="BuddyAllocator"/> class.
+    /// Initializes a new instance of the <see cref="BuddyAllocator"/> class backed by an aligned unmanaged host memory arena.
+    /// Does not eagerly fault physical pages across the arena at construction time.
     /// </summary>
-    /// <param name="arenaSizeBytes">Total capacity in bytes (must be a multiple of MaxBlockSize, default 64 MB).</param>
+    /// <param name="arenaSizeBytes">Total host arena capacity in bytes (aligned up to 128 KB; default 64 MB).</param>
     public unsafe BuddyAllocator(ulong arenaSizeBytes = MaxBlockSize * 2)
     {
-        if (arenaSizeBytes > (ulong)nint.MaxValue)
+        if (arenaSizeBytes == 0 || arenaSizeBytes > (ulong)nint.MaxValue - (MinBlockSize - 1))
         {
-            throw new ArgumentOutOfRangeException(nameof(arenaSizeBytes), "Arena size exceeds addressable memory range.");
+            throw new ArgumentOutOfRangeException(nameof(arenaSizeBytes), "Arena size must be greater than zero and within addressable memory range.");
         }
 
-        if (arenaSizeBytes < MaxBlockSize || (arenaSizeBytes % MaxBlockSize) != 0)
-        {
-            arenaSizeBytes = MaxBlockSize * 2;
-        }
-
-        _arenaSize = arenaSizeBytes;
+        ulong alignedArena = (arenaSizeBytes + MinBlockSize - 1) & ~(MinBlockSize - 1);
+        _arenaSize = alignedArena;
         _arenaBase = (IntPtr)NativeMemory.AlignedAlloc((nuint)_arenaSize, 4096);
-        NativeMemory.Clear((void*)_arenaBase, (nuint)_arenaSize);
+        _ownsHostMemory = true;
 
-        _freeLists = new HashSet<ulong>[OrderCount];
+        _freeLists = CreateFreeLists(_arenaSize);
+        _allocatedBlocks = new Dictionary<IntPtr, (ulong Offset, int Order)>();
+    }
+
+    /// <summary>
+    /// Initializes a new instance of the <see cref="BuddyAllocator"/> class backed by an external device or pinned arena
+    /// (such as CUDA <c>cuMemAlloc</c> / <c>cuMemHostAlloc</c> or Direct3D 12 / Vulkan memory).
+    /// Never dereferences <paramref name="baseAddress"/> on the CPU.
+    /// </summary>
+    /// <param name="baseAddress">Base device or pinned pointer of the backing arena.</param>
+    /// <param name="byteLength">Total capacity of the external arena in bytes (at least 128 KB).</param>
+    /// <param name="releaseAction">Optional callback invoked with <paramref name="baseAddress"/> upon <see cref="Dispose"/>.</param>
+    public BuddyAllocator(IntPtr baseAddress, ulong byteLength, Action<IntPtr>? releaseAction = null)
+    {
+        if (baseAddress == IntPtr.Zero)
+        {
+            throw new ArgumentOutOfRangeException(nameof(baseAddress), "External arena base address cannot be zero.");
+        }
+
+        if (byteLength < MinBlockSize || byteLength > (ulong)nint.MaxValue)
+        {
+            throw new ArgumentOutOfRangeException(nameof(byteLength), $"External buddy arena must be at least {MinBlockSize} bytes and within addressable bounds.");
+        }
+
+        _arenaBase = baseAddress;
+        _arenaSize = (byteLength / MinBlockSize) * MinBlockSize;
+        _ownsHostMemory = false;
+        _releaseAction = releaseAction;
+
+        _freeLists = CreateFreeLists(_arenaSize);
+        _allocatedBlocks = new Dictionary<IntPtr, (ulong Offset, int Order)>();
+    }
+
+    private static HashSet<ulong>[] CreateFreeLists(ulong arenaSize)
+    {
+        var freeLists = new HashSet<ulong>[OrderCount];
         for (int i = 0; i < OrderCount; i++)
         {
-            _freeLists[i] = new HashSet<ulong>();
+            freeLists[i] = new HashSet<ulong>();
         }
 
-        _allocatedBlocks = new Dictionary<IntPtr, (ulong Offset, int Order)>();
-
-        // Populate top-level 32 MB blocks into the highest order free list
-        int rootOrder = OrderCount - 1;
-        ulong rootBlockCount = _arenaSize / MaxBlockSize;
-        for (ulong i = 0; i < rootBlockCount; i++)
+        // Decompose arenaSize into aligned power-of-two buddy blocks from largest order down to Order 0
+        ulong offset = 0;
+        ulong remaining = arenaSize;
+        for (int order = OrderCount - 1; order >= 0; order--)
         {
-            _freeLists[rootOrder].Add(i * MaxBlockSize);
+            ulong blockSize = GetBlockSize(order);
+            while (remaining >= blockSize)
+            {
+                freeLists[order].Add(offset);
+                offset += blockSize;
+                remaining -= blockSize;
+            }
         }
+
+        return freeLists;
     }
 
     /// <summary>
@@ -114,13 +165,12 @@ public sealed class BuddyAllocator : IDisposable
             throw new ArgumentOutOfRangeException(nameof(byteCount), "Requested size exceeds maximum buddy block size of 32 MB.");
         }
 
-        // byteCount = MinBlockSize * 2^order
-        // 2^order >= byteCount / MinBlockSize
         ulong units = (byteCount + MinBlockSize - 1) / MinBlockSize;
         if (BitOperations.IsPow2(units))
         {
             return BitOperations.Log2(units);
         }
+
         return BitOperations.Log2(BitOperations.RoundUpToPowerOf2(units));
     }
 
@@ -138,7 +188,7 @@ public sealed class BuddyAllocator : IDisposable
     }
 
     /// <summary>
-    /// Allocates a contiguous block of device memory for the given byte size.
+    /// Sub-allocates a contiguous block of arena memory for the given byte size.
     /// </summary>
     public DevicePointer Allocate(ulong byteCount)
     {
@@ -154,7 +204,6 @@ public sealed class BuddyAllocator : IDisposable
 
         lock (_lock)
         {
-            // Find lowest order >= targetOrder that has a free block
             int currentOrder = targetOrder;
             while (currentOrder < OrderCount && _freeLists[currentOrder].Count == 0)
             {
@@ -163,16 +212,15 @@ public sealed class BuddyAllocator : IDisposable
 
             if (currentOrder >= OrderCount)
             {
-                throw new OutOfMemoryException($"BuddyAllocator arena exhausted. Cannot satisfy {byteCount} bytes (Order {targetOrder}). Total capacity: {_arenaSize} bytes, Allocated: {_allocatedBytes} bytes, Active blocks: {_allocatedBlocks.Count}.");
+                throw new OutOfMemoryException(
+                    $"BuddyAllocator arena exhausted. Cannot satisfy {byteCount} bytes (Order {targetOrder}). Total capacity: {_arenaSize} bytes, Allocated: {_allocatedBytes} bytes, Active blocks: {_allocatedBlocks.Count}.");
             }
 
-            // Pop a block from currentOrder
             var enumerator = _freeLists[currentOrder].GetEnumerator();
             enumerator.MoveNext();
             ulong blockOffset = enumerator.Current;
             _freeLists[currentOrder].Remove(blockOffset);
 
-            // Split downwards to targetOrder
             while (currentOrder > targetOrder)
             {
                 currentOrder--;
@@ -218,22 +266,24 @@ public sealed class BuddyAllocator : IDisposable
             ulong allocatedSize = GetBlockSize(order);
             _allocatedBytes -= allocatedSize;
 
-            // Coalesce buddies recursively
             while (order < OrderCount - 1)
             {
                 ulong blockSize = GetBlockSize(order);
-                ulong buddyOffset = blockOffset ^ blockSize;
+                ulong parentSize = blockSize << 1;
+                ulong parentStart = blockOffset & ~(parentSize - 1UL);
+                if (parentStart + parentSize > _arenaSize)
+                {
+                    break;
+                }
 
-                // Check if buddy block is free
+                ulong buddyOffset = blockOffset ^ blockSize;
                 if (_freeLists[order].Remove(buddyOffset))
                 {
-                    // Buddy is free! Coalesce into parent block at min(blockOffset, buddyOffset)
-                    blockOffset = Math.Min(blockOffset, buddyOffset);
+                    blockOffset = parentStart;
                     order++;
                 }
                 else
                 {
-                    // Buddy is not free, stop coalescing
                     break;
                 }
             }
@@ -282,7 +332,14 @@ public sealed class BuddyAllocator : IDisposable
                 _arenaBase = IntPtr.Zero;
                 if (basePtr != IntPtr.Zero)
                 {
-                    NativeMemory.AlignedFree((void*)basePtr);
+                    if (_ownsHostMemory)
+                    {
+                        NativeMemory.AlignedFree((void*)basePtr);
+                    }
+                    else
+                    {
+                        _releaseAction?.Invoke(basePtr);
+                    }
                 }
             }
         }

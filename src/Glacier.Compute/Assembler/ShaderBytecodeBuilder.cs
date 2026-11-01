@@ -12,7 +12,9 @@ using Glacier.Compute.Assembler.SpirV;
 
 /// <summary>
 /// Unified in-memory shader bytecode assembler implementing <see cref="IShaderBytecodeBuilder"/>.
-/// Generates NVIDIA PTX 8.0 text, binary SPIR-V 1.6, and Direct3D 12 DXBC/DXIL without external toolchains.
+/// Generates NVIDIA PTX 8.0 text and binary SPIR-V 1.6 modules directly in pure C# without external toolchains.
+/// Direct DXIL LLVM 3.7 synthesis is gated with <see cref="NotSupportedException"/>; use
+/// <see cref="DxbcContainerBuilder.PackagePrecompiledShader"/> for precompiled DXIL blobs.
 /// </summary>
 public sealed class ShaderBytecodeBuilder : IShaderBytecodeBuilder
 {
@@ -25,6 +27,9 @@ public sealed class ShaderBytecodeBuilder : IShaderBytecodeBuilder
     }
 
     /// <inheritdoc/>
+    /// <exception cref="NotSupportedException">
+    /// Always thrown because direct LLVM 3.7 DXIL bitcode emission requires external DXC compilation and <c>dxil.dll</c> signing.
+    /// </exception>
     public ReadOnlyMemory<byte> BuildDxil(ShaderStage stage, ReadOnlySpan<Instruction> instructions)
     {
         return DxbcContainerBuilder.BuildComputeShader(stage, instructions);

@@ -13,6 +13,20 @@ using Xunit;
 public class SlabAllocatorTests
 {
     [Fact]
+    public void SlabAllocator_LazilyMaterializesBinsOnFirstDemand()
+    {
+        using var allocator = new SlabAllocator(slotsPerBin: 64);
+
+        // Zero committed host bytes prior to first allocation
+        Assert.Equal(0UL, allocator.TotalCommittedBytes);
+
+        // Touch only the 1024-byte bin -> only 64 * 1024 = 65,536 bytes committed
+        var ptr = allocator.Allocate(1024);
+        Assert.Equal(64UL * 1024UL, allocator.TotalCommittedBytes);
+        Assert.True(allocator.Free(ptr));
+    }
+
+    [Fact]
     public void SlabAllocator_AllocatesAndFreesAllBinSizes()
     {
         using var allocator = new SlabAllocator(slotsPerBin: 64);
@@ -50,7 +64,6 @@ public class SlabAllocatorTests
             Assert.True(allocator.Free(pointers[i]));
         }
 
-        // Second free attempt should fail (double free prevention)
         for (int i = 0; i < count; i++)
         {
             Assert.False(allocator.Free(pointers[i]));
@@ -58,9 +71,30 @@ public class SlabAllocatorTests
     }
 
     [Fact]
+    public void SlabAllocator_ExternalArena_SubAllocatesAndReleases()
+    {
+        IntPtr externalBase = new IntPtr(0x0000_7200_0000_0000L);
+        const ulong byteLength = 1024 * 1024; // 1 MB -> 8 slots per bin across all 9 bins
+        IntPtr released = IntPtr.Zero;
+
+        using (var allocator = new SlabAllocator(externalBase, byteLength, p => released = p))
+        {
+            var p256 = allocator.Allocate(256);
+            var p64k = allocator.Allocate(65536);
+
+            Assert.True(allocator.Contains(p256.Address));
+            Assert.True(allocator.Contains(p64k.Address));
+            Assert.True(allocator.Free(p256));
+            Assert.True(allocator.Free(p64k));
+        }
+
+        Assert.Equal(externalBase, released);
+    }
+
+    [Fact]
     public void SlabAllocator_ThrowsOnInvalidSize()
     {
-        using var allocator = new SlabAllocator();
+        using var allocator = new SlabAllocator(slotsPerBin: 64);
 
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(0));
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(65537));

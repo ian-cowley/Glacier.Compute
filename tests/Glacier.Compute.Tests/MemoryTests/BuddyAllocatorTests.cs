@@ -15,21 +15,19 @@ public class BuddyAllocatorTests
     [Fact]
     public void BuddyAllocator_CalculatesCorrectOrders()
     {
-        Assert.Equal(0, BuddyAllocator.GetOrderForSize(128 * 1024)); // 128 KB -> Order 0
-        Assert.Equal(1, BuddyAllocator.GetOrderForSize(200 * 1024)); // 200 KB -> Order 1 (256 KB)
-        Assert.Equal(1, BuddyAllocator.GetOrderForSize(256 * 1024)); // 256 KB -> Order 1
-        Assert.Equal(2, BuddyAllocator.GetOrderForSize(512 * 1024)); // 512 KB -> Order 2
-        Assert.Equal(3, BuddyAllocator.GetOrderForSize(1024 * 1024)); // 1 MB -> Order 3
-        Assert.Equal(8, BuddyAllocator.GetOrderForSize(32 * 1024 * 1024)); // 32 MB -> Order 8
+        Assert.Equal(0, BuddyAllocator.GetOrderForSize(128 * 1024));
+        Assert.Equal(1, BuddyAllocator.GetOrderForSize(200 * 1024));
+        Assert.Equal(1, BuddyAllocator.GetOrderForSize(256 * 1024));
+        Assert.Equal(2, BuddyAllocator.GetOrderForSize(512 * 1024));
+        Assert.Equal(3, BuddyAllocator.GetOrderForSize(1024 * 1024));
+        Assert.Equal(8, BuddyAllocator.GetOrderForSize(32 * 1024 * 1024));
     }
 
     [Fact]
     public void BuddyAllocator_SplitsAndCoalescesBuddies()
     {
-        // 64 MB arena (two 32 MB blocks)
         using var allocator = new BuddyAllocator(64 * 1024 * 1024);
 
-        // Allocate two 128 KB blocks (will split root block down to order 0)
         var p1 = allocator.Allocate(128 * 1024);
         var p2 = allocator.Allocate(128 * 1024);
 
@@ -39,11 +37,9 @@ public class BuddyAllocatorTests
         Assert.True(allocator.Contains(p1.Address));
         Assert.True(allocator.Contains(p2.Address));
 
-        // Free both blocks - they should recursively coalesce back together
         Assert.True(allocator.Free(p1));
         Assert.True(allocator.Free(p2));
 
-        // Now allocate the entire 32 MB block; should succeed because coalescing restored it!
         var pFull = allocator.Allocate(32 * 1024 * 1024);
         Assert.False(pFull.IsNull);
         Assert.Equal(32UL * 1024 * 1024, pFull.SizeInBytes);
@@ -52,9 +48,35 @@ public class BuddyAllocatorTests
     }
 
     [Fact]
+    public void BuddyAllocator_ExternalArena_SubAllocatesCoalescesAndReleases()
+    {
+        IntPtr externalBase = new IntPtr(0x0000_7300_0000_0000L);
+        const ulong arenaBytes = 4UL * 1024 * 1024; // 4 MB
+        IntPtr released = IntPtr.Zero;
+
+        using (var allocator = new BuddyAllocator(externalBase, arenaBytes, p => released = p))
+        {
+            var a = allocator.Allocate(2 * 1024 * 1024);
+            var b = allocator.Allocate(2 * 1024 * 1024);
+            Assert.Equal(arenaBytes, allocator.AllocatedBytes);
+
+            Assert.True(allocator.Free(a));
+            Assert.True(allocator.Free(b));
+            Assert.Equal(0UL, allocator.AllocatedBytes);
+
+            // Coalesced back into full 4 MB block
+            var merged = allocator.Allocate(4 * 1024 * 1024);
+            Assert.Equal(externalBase, merged.Address);
+            Assert.True(allocator.Free(merged));
+        }
+
+        Assert.Equal(externalBase, released);
+    }
+
+    [Fact]
     public void BuddyAllocator_ThrowsOnExcessiveSize()
     {
-        using var allocator = new BuddyAllocator();
+        using var allocator = new BuddyAllocator(1024 * 1024);
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(0));
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(33 * 1024 * 1024));
     }

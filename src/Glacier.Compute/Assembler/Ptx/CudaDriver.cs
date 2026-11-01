@@ -29,72 +29,49 @@ public enum CUresult : int
 }
 
 /// <summary>
-/// Direct pure C# P/Invoke bindings to the NVIDIA CUDA Driver API (nvcuda.dll / libcuda.so).
-/// Eliminates runtime CUDA runtime libraries (cudart) and enables zero-latency JIT module loading.
+/// Direct Native AOT-safe function-pointer bindings to the NVIDIA CUDA Driver API (<c>nvcuda.dll</c> / <c>libcuda.so</c>).
+/// Eliminates runtime CUDA libraries (<c>cudart</c>) and dynamic marshaling stubs for zero-latency JIT module loading.
 /// </summary>
 public static unsafe class CudaDriver
 {
     private static readonly IntPtr s_driverHandle;
     private static readonly bool s_isAvailable;
 
-    // Delegates for driver entry points
-    private delegate CUresult CuInitDelegate(uint flags);
-    private delegate CUresult CuDeviceGetDelegate(out IntPtr device, int ordinal);
-    private delegate CUresult CuCtxCreateDelegate(out IntPtr pctx, uint flags, IntPtr dev);
-    private delegate CUresult CuCtxDestroyDelegate(IntPtr ctx);
-    private delegate CUresult CuCtxSynchronizeDelegate();
-    private delegate CUresult CuModuleLoadDataExDelegate(out IntPtr module, byte* image, uint numOptions, IntPtr options, IntPtr optionValues);
-    private delegate CUresult CuModuleLoadDataDelegate(out IntPtr module, byte* image);
-    private delegate CUresult CuModuleUnloadDelegate(IntPtr module);
-    private delegate CUresult CuModuleGetFunctionDelegate(out IntPtr hfunc, IntPtr hmod, [MarshalAs(UnmanagedType.LPStr)] string name);
-    private delegate CUresult CuLaunchKernelDelegate(
-        IntPtr f,
-        uint gridDimX, uint gridDimY, uint gridDimZ,
-        uint blockDimX, uint blockDimY, uint blockDimZ,
-        uint sharedMemBytes,
-        IntPtr hStream,
-        void** kernelParams,
-        void** extra);
-    private delegate CUresult CuMemAllocDelegate(out IntPtr dptr, nuint bytesize);
-    private delegate CUresult CuMemFreeDelegate(IntPtr dptr);
-    private delegate CUresult CuMemcpyHtoDDelegate(IntPtr dstDevice, void* srcHost, nuint ByteCount);
-    private delegate CUresult CuMemcpyDtoHDelegate(void* dstHost, IntPtr srcDevice, nuint ByteCount);
-
-    private static readonly CuInitDelegate? s_cuInit;
-    private static readonly CuDeviceGetDelegate? s_cuDeviceGet;
-    private static readonly CuCtxCreateDelegate? s_cuCtxCreate;
-    private static readonly CuCtxDestroyDelegate? s_cuCtxDestroy;
-    private static readonly CuCtxSynchronizeDelegate? s_cuCtxSynchronize;
-    private static readonly CuModuleLoadDataExDelegate? s_cuModuleLoadDataEx;
-    private static readonly CuModuleLoadDataDelegate? s_cuModuleLoadData;
-    private static readonly CuModuleUnloadDelegate? s_cuModuleUnload;
-    private static readonly CuModuleGetFunctionDelegate? s_cuModuleGetFunction;
-    private static readonly CuLaunchKernelDelegate? s_cuLaunchKernel;
-    private static readonly CuMemAllocDelegate? s_cuMemAlloc;
-    private static readonly CuMemFreeDelegate? s_cuMemFree;
-    private static readonly CuMemcpyHtoDDelegate? s_cuMemcpyHtoD;
-    private static readonly CuMemcpyDtoHDelegate? s_cuMemcpyDtoH;
+    private static readonly delegate* unmanaged<uint, CUresult> s_cuInit;
+    private static readonly delegate* unmanaged<IntPtr*, int, CUresult> s_cuDeviceGet;
+    private static readonly delegate* unmanaged<IntPtr*, uint, IntPtr, CUresult> s_cuCtxCreate;
+    private static readonly delegate* unmanaged<IntPtr, CUresult> s_cuCtxDestroy;
+    private static readonly delegate* unmanaged<CUresult> s_cuCtxSynchronize;
+    private static readonly delegate* unmanaged<IntPtr*, byte*, uint, IntPtr, IntPtr, CUresult> s_cuModuleLoadDataEx;
+    private static readonly delegate* unmanaged<IntPtr*, byte*, CUresult> s_cuModuleLoadData;
+    private static readonly delegate* unmanaged<IntPtr, CUresult> s_cuModuleUnload;
+    private static readonly delegate* unmanaged<IntPtr*, IntPtr, byte*, CUresult> s_cuModuleGetFunction;
+    private static readonly delegate* unmanaged<IntPtr, uint, uint, uint, uint, uint, uint, uint, IntPtr, void**, void**, CUresult> s_cuLaunchKernel;
+    private static readonly delegate* unmanaged<IntPtr*, nuint, CUresult> s_cuMemAlloc;
+    private static readonly delegate* unmanaged<IntPtr, CUresult> s_cuMemFree;
+    private static readonly delegate* unmanaged<IntPtr, void*, nuint, CUresult> s_cuMemcpyHtoD;
+    private static readonly delegate* unmanaged<void*, IntPtr, nuint, CUresult> s_cuMemcpyDtoH;
 
     static CudaDriver()
     {
-        string libraryName = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "nvcuda.dll" : "libcuda.so";
+        string libraryName = OperatingSystem.IsWindows() ? "nvcuda.dll" : "libcuda.so";
         if (NativeLibrary.TryLoad(libraryName, typeof(CudaDriver).Assembly, null, out s_driverHandle) ||
             NativeLibrary.TryLoad("libcuda.so.1", typeof(CudaDriver).Assembly, null, out s_driverHandle))
         {
-            s_cuInit = GetProc<CuInitDelegate>("cuInit");
-            s_cuDeviceGet = GetProc<CuDeviceGetDelegate>("cuDeviceGet");
-            s_cuCtxCreate = GetProc<CuCtxCreateDelegate>("cuCtxCreate_v2") ?? GetProc<CuCtxCreateDelegate>("cuCtxCreate");
-            s_cuCtxDestroy = GetProc<CuCtxDestroyDelegate>("cuCtxDestroy_v2") ?? GetProc<CuCtxDestroyDelegate>("cuCtxDestroy");
-            s_cuCtxSynchronize = GetProc<CuCtxSynchronizeDelegate>("cuCtxSynchronize");
-            s_cuModuleLoadDataEx = GetProc<CuModuleLoadDataExDelegate>("cuModuleLoadDataEx");
-            s_cuModuleLoadData = GetProc<CuModuleLoadDataDelegate>("cuModuleLoadData");
-            s_cuModuleUnload = GetProc<CuModuleUnloadDelegate>("cuModuleUnload");
-            s_cuModuleGetFunction = GetProc<CuModuleGetFunctionDelegate>("cuModuleGetFunction");
-            s_cuLaunchKernel = GetProc<CuLaunchKernelDelegate>("cuLaunchKernel");
-            s_cuMemAlloc = GetProc<CuMemAllocDelegate>("cuMemAlloc_v2") ?? GetProc<CuMemAllocDelegate>("cuMemAlloc");
-            s_cuMemFree = GetProc<CuMemFreeDelegate>("cuMemFree_v2") ?? GetProc<CuMemFreeDelegate>("cuMemFree");
-            s_cuMemcpyHtoD = GetProc<CuMemcpyHtoDDelegate>("cuMemcpyHtoD_v2") ?? GetProc<CuMemcpyHtoDDelegate>("cuMemcpyHtoD");
-            s_cuMemcpyDtoH = GetProc<CuMemcpyDtoHDelegate>("cuMemcpyDtoH_v2") ?? GetProc<CuMemcpyDtoHDelegate>("cuMemcpyDtoH");
+            s_cuInit = (delegate* unmanaged<uint, CUresult>)GetProcAddress("cuInit");
+            s_cuDeviceGet = (delegate* unmanaged<IntPtr*, int, CUresult>)GetProcAddress("cuDeviceGet");
+            s_cuCtxCreate = (delegate* unmanaged<IntPtr*, uint, IntPtr, CUresult>)GetProcAddress("cuCtxCreate_v2", "cuCtxCreate");
+            s_cuCtxDestroy = (delegate* unmanaged<IntPtr, CUresult>)GetProcAddress("cuCtxDestroy_v2", "cuCtxDestroy");
+            s_cuCtxSynchronize = (delegate* unmanaged<CUresult>)GetProcAddress("cuCtxSynchronize");
+            s_cuModuleLoadDataEx = (delegate* unmanaged<IntPtr*, byte*, uint, IntPtr, IntPtr, CUresult>)GetProcAddress("cuModuleLoadDataEx");
+            s_cuModuleLoadData = (delegate* unmanaged<IntPtr*, byte*, CUresult>)GetProcAddress("cuModuleLoadData");
+            s_cuModuleUnload = (delegate* unmanaged<IntPtr, CUresult>)GetProcAddress("cuModuleUnload");
+            s_cuModuleGetFunction = (delegate* unmanaged<IntPtr*, IntPtr, byte*, CUresult>)GetProcAddress("cuModuleGetFunction");
+            s_cuLaunchKernel = (delegate* unmanaged<IntPtr, uint, uint, uint, uint, uint, uint, uint, IntPtr, void**, void**, CUresult>)GetProcAddress("cuLaunchKernel");
+            s_cuMemAlloc = (delegate* unmanaged<IntPtr*, nuint, CUresult>)GetProcAddress("cuMemAlloc_v2", "cuMemAlloc");
+            s_cuMemFree = (delegate* unmanaged<IntPtr, CUresult>)GetProcAddress("cuMemFree_v2", "cuMemFree");
+            s_cuMemcpyHtoD = (delegate* unmanaged<IntPtr, void*, nuint, CUresult>)GetProcAddress("cuMemcpyHtoD_v2", "cuMemcpyHtoD");
+            s_cuMemcpyDtoH = (delegate* unmanaged<void*, IntPtr, nuint, CUresult>)GetProcAddress("cuMemcpyDtoH_v2", "cuMemcpyDtoH");
 
             if (s_cuInit != null)
             {
@@ -104,13 +81,22 @@ public static unsafe class CudaDriver
         }
     }
 
-    private static T? GetProc<T>(string name) where T : Delegate
+    private static IntPtr GetProcAddress(string primaryName, string? fallbackName = null)
     {
-        if (s_driverHandle != IntPtr.Zero && NativeLibrary.TryGetExport(s_driverHandle, name, out IntPtr address))
+        if (s_driverHandle != IntPtr.Zero)
         {
-            return Marshal.GetDelegateForFunctionPointer<T>(address);
+            if (NativeLibrary.TryGetExport(s_driverHandle, primaryName, out IntPtr address))
+            {
+                return address;
+            }
+
+            if (fallbackName is not null && NativeLibrary.TryGetExport(s_driverHandle, fallbackName, out address))
+            {
+                return address;
+            }
         }
-        return null;
+
+        return IntPtr.Zero;
     }
 
     /// <summary>
@@ -122,53 +108,71 @@ public static unsafe class CudaDriver
     public static CUresult cuInit(uint flags)
     {
         EnsureAvailable();
-        return s_cuInit!(flags);
+        return s_cuInit(flags);
     }
 
     /// <summary>Returns a handle to a compute device.</summary>
     public static CUresult cuDeviceGet(out IntPtr device, int ordinal)
     {
         EnsureAvailable();
-        return s_cuDeviceGet!(out device, ordinal);
+        IntPtr dev = IntPtr.Zero;
+        CUresult res = s_cuDeviceGet(&dev, ordinal);
+        device = dev;
+        return res;
     }
 
     /// <summary>Creates a CUDA context for the specified device.</summary>
     public static CUresult cuCtxCreate(out IntPtr pctx, uint flags, IntPtr dev)
     {
         EnsureAvailable();
-        return s_cuCtxCreate!(out pctx, flags, dev);
+        IntPtr ctx = IntPtr.Zero;
+        CUresult res = s_cuCtxCreate(&ctx, flags, dev);
+        pctx = ctx;
+        return res;
     }
 
     /// <summary>Destroys a CUDA context.</summary>
     public static CUresult cuCtxDestroy(IntPtr ctx)
     {
         EnsureAvailable();
-        return s_cuCtxDestroy!(ctx);
+        return s_cuCtxDestroy(ctx);
     }
 
     /// <summary>Blocks until the device has completed all preceding requested tasks.</summary>
     public static CUresult cuCtxSynchronize()
     {
         EnsureAvailable();
-        return s_cuCtxSynchronize!();
+        return s_cuCtxSynchronize();
     }
 
     /// <summary>Loads a compute module from PTX assembly data.</summary>
     public static CUresult cuModuleLoadDataEx(out IntPtr module, string ptxSource)
     {
+        ArgumentNullException.ThrowIfNull(ptxSource);
         EnsureAvailable();
-        byte[] bytes = Encoding.UTF8.GetBytes(ptxSource + "\0");
+
+        int utf8ByteCount = Encoding.UTF8.GetByteCount(ptxSource);
+        byte[] bytes = new byte[utf8ByteCount + 1];
+        Encoding.UTF8.GetBytes(ptxSource, bytes.AsSpan(0, utf8ByteCount));
+
+        IntPtr mod = IntPtr.Zero;
         fixed (byte* pBytes = bytes)
         {
             if (s_cuModuleLoadDataEx != null)
             {
-                return s_cuModuleLoadDataEx(out module, pBytes, 0, IntPtr.Zero, IntPtr.Zero);
+                CUresult res = s_cuModuleLoadDataEx(&mod, pBytes, 0, IntPtr.Zero, IntPtr.Zero);
+                module = mod;
+                return res;
             }
+
             if (s_cuModuleLoadData != null)
             {
-                return s_cuModuleLoadData(out module, pBytes);
+                CUresult res = s_cuModuleLoadData(&mod, pBytes);
+                module = mod;
+                return res;
             }
         }
+
         throw new NotSupportedException("cuModuleLoadData not found in CUDA driver.");
     }
 
@@ -176,14 +180,32 @@ public static unsafe class CudaDriver
     public static CUresult cuModuleUnload(IntPtr module)
     {
         EnsureAvailable();
-        return s_cuModuleUnload!(module);
+        return s_cuModuleUnload(module);
     }
 
-    /// <summary>Returns a function handle from a module.</summary>
+    /// <summary>Returns a function handle from a module using blittable UTF-8 marshaling.</summary>
     public static CUresult cuModuleGetFunction(out IntPtr hfunc, IntPtr hmod, string name)
     {
+        ArgumentNullException.ThrowIfNull(name);
         EnsureAvailable();
-        return s_cuModuleGetFunction!(out hfunc, hmod, name);
+
+        int utf8Len = Encoding.UTF8.GetByteCount(name);
+        byte[]? rented = null;
+        Span<byte> utf8Buffer = utf8Len < 256
+            ? stackalloc byte[utf8Len + 1]
+            : (rented = new byte[utf8Len + 1]);
+
+        Encoding.UTF8.GetBytes(name, utf8Buffer[..utf8Len]);
+        utf8Buffer[utf8Len] = 0;
+
+        IntPtr fn = IntPtr.Zero;
+        fixed (byte* pName = utf8Buffer)
+        {
+            CUresult res = s_cuModuleGetFunction(&fn, hmod, pName);
+            hfunc = fn;
+            _ = rented;
+            return res;
+        }
     }
 
     /// <summary>Launches a compute kernel on the GPU.</summary>
@@ -195,7 +217,9 @@ public static unsafe class CudaDriver
         IntPtr hStream,
         IntPtr[] kernelParams)
     {
+        ArgumentNullException.ThrowIfNull(kernelParams);
         EnsureAvailable();
+
         void*[] paramPointers = new void*[kernelParams.Length];
         fixed (IntPtr* pParams = kernelParams)
         {
@@ -203,9 +227,10 @@ public static unsafe class CudaDriver
             {
                 paramPointers[i] = &pParams[i];
             }
+
             fixed (void** ppParams = paramPointers)
             {
-                return s_cuLaunchKernel!(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, ppParams, null);
+                return s_cuLaunchKernel(f, gridDimX, gridDimY, gridDimZ, blockDimX, blockDimY, blockDimZ, sharedMemBytes, hStream, ppParams, null);
             }
         }
     }
@@ -214,28 +239,31 @@ public static unsafe class CudaDriver
     public static CUresult cuMemAlloc(out IntPtr dptr, nuint bytesize)
     {
         EnsureAvailable();
-        return s_cuMemAlloc!(out dptr, bytesize);
+        IntPtr ptr = IntPtr.Zero;
+        CUresult res = s_cuMemAlloc(&ptr, bytesize);
+        dptr = ptr;
+        return res;
     }
 
     /// <summary>Frees allocated device VRAM.</summary>
     public static CUresult cuMemFree(IntPtr dptr)
     {
         EnsureAvailable();
-        return s_cuMemFree!(dptr);
+        return s_cuMemFree(dptr);
     }
 
     /// <summary>Copies memory from host to device.</summary>
     public static CUresult cuMemcpyHtoD(IntPtr dstDevice, void* srcHost, nuint byteCount)
     {
         EnsureAvailable();
-        return s_cuMemcpyHtoD!(dstDevice, srcHost, byteCount);
+        return s_cuMemcpyHtoD(dstDevice, srcHost, byteCount);
     }
 
     /// <summary>Copies memory from device to host.</summary>
     public static CUresult cuMemcpyDtoH(void* dstHost, IntPtr srcDevice, nuint byteCount)
     {
         EnsureAvailable();
-        return s_cuMemcpyDtoH!(dstHost, srcDevice, byteCount);
+        return s_cuMemcpyDtoH(dstHost, srcDevice, byteCount);
     }
 
     private static void EnsureAvailable()

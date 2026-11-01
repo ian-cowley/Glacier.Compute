@@ -12,7 +12,7 @@ using Glacier.Compute.Assembler;
 
 /// <summary>
 /// Unified compute shader pipeline orchestrator. Manages instruction compilation,
-/// bytecode translation across PTX, SPIR-V, and DXIL/DXBC, and kernel caching.
+/// bytecode translation across PTX 8.0 and SPIR-V 1.6 (plus optional custom DXIL builders), and kernel caching.
 /// </summary>
 public sealed class ShaderPipeline
 {
@@ -35,8 +35,9 @@ public sealed class ShaderPipeline
     }
 
     /// <summary>
-    /// Compiles an instruction sequence into a <see cref="ComputeKernel"/> for all requested backends,
-    /// caching the result by instruction hash for instant reuse.
+    /// Compiles an instruction sequence into a <see cref="ComputeKernel"/> for the requested backends,
+    /// caching the result by instruction and target-flag hash for instant reuse.
+    /// Defaults <paramref name="includeDxil"/> to <see langword="false"/> because direct DXIL synthesis requires external DXC signing.
     /// </summary>
     public ComputeKernel Compile(
         string kernelName,
@@ -44,25 +45,29 @@ public sealed class ShaderPipeline
         ReadOnlySpan<Instruction> instructions,
         bool includePtx = true,
         bool includeSpirv = true,
-        bool includeDxil = true)
+        bool includeDxil = false)
     {
-        ulong hash = ComputeInstructionsHash(instructions, stage);
-        if (_kernelCache.TryGetValue(hash, out var existing))
+        ArgumentNullException.ThrowIfNull(kernelName);
+
+        ulong baseHash = ComputeInstructionsHash(instructions, stage);
+        ulong flagsMask = (includePtx ? 1UL : 0UL) | (includeSpirv ? 2UL : 0UL) | (includeDxil ? 4UL : 0UL);
+        ulong cacheKey = (baseHash ^ (flagsMask * 0x9E3779B97F4A7C15UL)) * 1099511628211UL;
+
+        if (_kernelCache.TryGetValue(cacheKey, out var existing))
         {
             return existing;
         }
 
         string? ptx = includePtx ? _builder.BuildPtx(instructions) : null;
-        ReadOnlyMemory<byte>? spirv = includeSpirv ? _builder.BuildSpirV(stage, instructions) : null;
-        ReadOnlyMemory<byte>? dxil = includeDxil ? _builder.BuildDxil(stage, instructions) : null;
+        ReadOnlyMemory<byte>? spirv = includeSpirv ? (ReadOnlyMemory<byte>?)_builder.BuildSpirV(stage, instructions) : null;
+        ReadOnlyMemory<byte>? dxil = includeDxil ? (ReadOnlyMemory<byte>?)_builder.BuildDxil(stage, instructions) : null;
 
         var kernel = new ComputeKernel(kernelName, stage, ptx, spirv, dxil);
-        _kernelCache.TryAdd(hash, kernel);
-        return kernel;
+        return _kernelCache.GetOrAdd(cacheKey, kernel);
     }
 
     /// <summary>
-    /// Computes a 64-bit non-cryptographic hash for the instruction sequence.
+    /// Computes a 64-bit FNV-1a non-cryptographic hash for the instruction sequence and stage.
     /// </summary>
     public static ulong ComputeInstructionsHash(ReadOnlySpan<Instruction> instructions, ShaderStage stage)
     {
