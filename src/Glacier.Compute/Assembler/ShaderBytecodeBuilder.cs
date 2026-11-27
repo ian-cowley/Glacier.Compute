@@ -18,12 +18,10 @@ using Glacier.Compute.Assembler.SpirV;
 /// </summary>
 public sealed class ShaderBytecodeBuilder : IShaderBytecodeBuilder
 {
-    private readonly SpirvBinaryEmitter _spirvEmitter = new();
-
     /// <inheritdoc/>
     public ReadOnlyMemory<byte> BuildSpirV(ShaderStage stage, ReadOnlySpan<Instruction> instructions)
     {
-        return _spirvEmitter.EmitModule(stage, instructions);
+        return new SpirvBinaryEmitter().EmitModule(stage, instructions);
     }
 
     /// <inheritdoc/>

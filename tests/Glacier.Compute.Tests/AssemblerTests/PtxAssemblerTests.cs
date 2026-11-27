@@ -66,8 +66,10 @@ public class PtxAssemblerTests
         Assert.Contains("max.f32 %f25, %f23, %f24;", ptx);
         Assert.Contains("sqrt.rn.f32 %f27, %f26;", ptx);
         Assert.Contains("rsqrt.approx.f32 %f29, %f28;", ptx);
-        Assert.Contains("ex2.approx.f32 %f31, %f30;", ptx);
+        Assert.Contains("mul.f32 %f31, %f30, 0f3FB8AA3B;", ptx);
+        Assert.Contains("ex2.approx.f32 %f31, %f31;", ptx);
         Assert.Contains("lg2.approx.f32 %f33, %f32;", ptx);
+        Assert.Contains("mul.f32 %f33, %f33, 0f3F317218;", ptx);
         Assert.Contains("tanh.approx.f32 %f35, %f34;", ptx);
     }
 
@@ -82,18 +84,24 @@ public class PtxAssemblerTests
             new((int)ComputeOpcode.GlobalId, 0, 0, 6),
             new((int)ComputeOpcode.LoadShared, 0, 7, 8),
             new((int)ComputeOpcode.StoreShared, 9, 10, 0),
-            new((int)ComputeOpcode.AtomicAdd, 11, 12, 13)
+            new((int)ComputeOpcode.AtomicAdd, 11, 12, 13),
+            new((int)ComputeOpcode.LoadGlobal, 1, 5, 14),
+            new((int)ComputeOpcode.LoadConstant, BitConverter.SingleToInt32Bits(2.5f), 0, 15)
         };
 
         string ptx = PtxEmitter.Emit(instructions);
 
-        Assert.Contains("shfl.sync.bfly.b32 %f2, %f1, 16, 0x1f, 0xffffffff;", ptx);
+        Assert.Contains("mov.b32 %r60, %f1;", ptx);
+        Assert.Contains("shfl.sync.bfly.b32 %r61, %r60, 16, 0x1f, 0xffffffff;", ptx);
+        Assert.Contains("mov.b32 %f2, %r61;", ptx);
         Assert.Contains("bar.sync 0;", ptx);
         Assert.Contains("mov.u32 %r5, %tid.x;", ptx);
         Assert.Contains("mov.u32 %r6, %r5;", ptx);
         Assert.Contains("ld.shared.f32 %f8, [%rd16];", ptx);
         Assert.Contains("st.shared.f32 [%rd19], %f9;", ptx);
         Assert.Contains("atom.global.add.f32 %f13, [%rd21], %f11;", ptx);
+        Assert.Contains("add.u64 %rd11, %rd2, %rd10;", ptx);
+        Assert.Contains("mov.f32 %f15, 0f40200000;", ptx);
     }
 
     [Fact]

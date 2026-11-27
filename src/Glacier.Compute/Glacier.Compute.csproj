@@ -12,7 +12,8 @@
 
     <!-- NuGet Package Properties -->
     <PackageId>Glacier.Compute</PackageId>
-    <Version>1.1.0</Version>
+    <Version>1.1.1</Version>
+    <PackageReleaseNotes>v1.1.1: Stability and kernel emission reliability fixes from adversarial ecosystem audit.</PackageReleaseNotes>
     <Authors>Ian Cowley</Authors>
     <Company>Glacier High-Performance Ecosystem</Company>
     <Description>Pure C# .NET 10 In-Memory Shader Bytecode Assembler (PTX 8.0, SPIR-V 1.6, DXBC Container Packager), Multi-Tier Device and Host Arena Sub-Allocator, and Distributed Ring AllReduce with SIMD Vectorization.</Description>

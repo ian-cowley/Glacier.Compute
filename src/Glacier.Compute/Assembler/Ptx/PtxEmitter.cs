@@ -137,11 +137,13 @@ public static class PtxEmitter
                     break;
 
                 case ComputeOpcode.Exp:
-                    sb.Append("    ex2.approx.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    sb.Append("    mul.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(", 0f3FB8AA3B;");
+                    sb.Append("    ex2.approx.f32 %f").Append(d).Append(", %f").Append(d).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Log:
                     sb.Append("    lg2.approx.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    sb.Append("    mul.f32 %f").Append(d).Append(", %f").Append(d).AppendLine(", 0f3F317218;");
                     break;
 
                 case ComputeOpcode.Tanh:
@@ -149,10 +151,18 @@ public static class PtxEmitter
                     break;
 
                 case ComputeOpcode.LoadGlobal:
+                {
+                    string basePtrReg = inst.OperandA switch
+                    {
+                        1 => "%rd2",
+                        2 => "%rd3",
+                        _ => "%rd1"
+                    };
                     sb.Append("    mul.wide.u32 %rd10, %r").Append(b).AppendLine(", 4;");
-                    sb.AppendLine("    add.u64 %rd11, %rd1, %rd10;");
+                    sb.Append("    add.u64 %rd11, ").Append(basePtrReg).AppendLine(", %rd10;");
                     sb.Append("    ld.global.f32 %f").Append(d).AppendLine(", [%rd11];");
                     break;
+                }
 
                 case ComputeOpcode.StoreGlobal:
                     sb.Append("    mul.wide.u32 %rd12, %r").Append(b).AppendLine(", 4;");
@@ -175,12 +185,14 @@ public static class PtxEmitter
                     break;
 
                 case ComputeOpcode.LoadConstant:
-                    sb.Append("    mov.b32 %f").Append(d).Append(", ").Append(BitConverter.UInt32BitsToSingle((uint)inst.OperandA).ToString("R", System.Globalization.CultureInfo.InvariantCulture)).AppendLine(";");
+                    sb.Append("    mov.f32 %f").Append(d).Append(", 0f").Append(((uint)inst.OperandA).ToString("X8", System.Globalization.CultureInfo.InvariantCulture)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.ShflSyncBfly:
                     int laneMask = inst.OperandB != 0 ? inst.OperandB : 16;
-                    sb.Append("    shfl.sync.bfly.b32 %f").Append(d).Append(", %f").Append(a).Append(", ").Append(laneMask).AppendLine(", 0x1f, 0xffffffff;");
+                    sb.Append("    mov.b32 %r60, %f").Append(a).AppendLine(";");
+                    sb.Append("    shfl.sync.bfly.b32 %r61, %r60, ").Append(laneMask).AppendLine(", 0x1f, 0xffffffff;");
+                    sb.Append("    mov.b32 %f").Append(d).AppendLine(", %r61;");
                     break;
 
                 case ComputeOpcode.BarrierSync:
