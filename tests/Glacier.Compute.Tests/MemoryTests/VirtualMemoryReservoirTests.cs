@@ -47,4 +47,92 @@ public class VirtualMemoryReservoirTests
         // Exceeds total reservation
         Assert.Throws<OutOfMemoryException>(() => reservoir.Allocate(1024));
     }
+
+    [Fact]
+    public void VirtualMemoryReservoir_ReusesMiddleHole_BestFit_WithoutIncreasingCommittedWatermark()
+    {
+        using var reservoir = new VirtualMemoryReservoir(64 * 1024 * 1024);
+
+        var a = reservoir.Allocate(8 * 1024 * 1024);
+        var b = reservoir.Allocate(16 * 1024 * 1024);
+        var c = reservoir.Allocate(8 * 1024 * 1024);
+        ulong watermarkBeforeFree = reservoir.TotalCommittedBytes;
+
+        Assert.True(reservoir.Free(b));
+        Assert.Equal(16UL * 1024 * 1024, reservoir.ActiveAllocatedBytes);
+
+        // Re-allocating 16 MB must reuse B's exact VA slot without advancing the committed watermark.
+        var b2 = reservoir.Allocate(16 * 1024 * 1024);
+        Assert.Equal(b.Address, b2.Address);
+        Assert.Equal(watermarkBeforeFree, reservoir.TotalCommittedBytes);
+        Assert.Equal(32UL * 1024 * 1024, reservoir.ActiveAllocatedBytes);
+
+        Assert.True(reservoir.Free(a));
+        Assert.True(reservoir.Free(b2));
+        Assert.True(reservoir.Free(c));
+        Assert.Equal(0UL, reservoir.ActiveAllocatedBytes);
+    }
+
+    [Fact]
+    public void VirtualMemoryReservoir_CoalescesAdjacentHolesAndTailRewind()
+    {
+        using var reservoir = new VirtualMemoryReservoir(64 * 1024 * 1024);
+
+        var p1 = reservoir.Allocate(16 * 1024 * 1024);
+        var p2 = reservoir.Allocate(16 * 1024 * 1024);
+        var p3 = reservoir.Allocate(16 * 1024 * 1024);
+        var p4 = reservoir.Allocate(16 * 1024 * 1024);
+
+        // Free middle blocks in reverse/non-adjacent order then merge across them
+        Assert.True(reservoir.Free(p1));
+        Assert.True(reservoir.Free(p3));
+        Assert.True(reservoir.Free(p2)); // merges p1 + p2 + p3 into 48 MB hole
+
+        var merged48 = reservoir.Allocate(48 * 1024 * 1024);
+        Assert.Equal(p1.Address, merged48.Address);
+
+        // Free tail p4 (and merged48), then verify full 64 MB can be allocated via tail rewind
+        Assert.True(reservoir.Free(p4));
+        Assert.True(reservoir.Free(merged48));
+
+        var full64 = reservoir.Allocate(64 * 1024 * 1024);
+        Assert.Equal(reservoir.BaseAddress, full64.Address);
+        Assert.True(reservoir.Free(full64));
+    }
+
+    [Fact]
+    public void VirtualMemoryReservoir_RepeatedAllocFreeCycles_NeverLeaksVirtualAddressSpace()
+    {
+        using var reservoir = new VirtualMemoryReservoir(64 * 1024 * 1024);
+
+        // 1,000 x 8 MB = 8 GB cumulative allocations inside a 64 MB reservoir
+        for (int i = 0; i < 1000; i++)
+        {
+            var ptr = reservoir.Allocate(8 * 1024 * 1024);
+            Assert.True(reservoir.Contains(ptr.Address));
+            Assert.True(reservoir.Free(ptr));
+        }
+
+        Assert.Equal(0UL, reservoir.ActiveAllocatedBytes);
+    }
+
+    [Fact]
+    public void VirtualMemoryReservoir_ExternalArena_ReusesCoalescedIntervals()
+    {
+        IntPtr externalBase = new IntPtr(0x0000_7300_0000_0000L);
+        using var reservoir = new VirtualMemoryReservoir(externalBase, 16UL * 1024 * 1024);
+
+        var a = reservoir.Allocate(4 * 1024 * 1024);
+        var b = reservoir.Allocate(4 * 1024 * 1024);
+        var c = reservoir.Allocate(8 * 1024 * 1024);
+
+        Assert.True(reservoir.Free(a));
+        Assert.True(reservoir.Free(b));
+
+        var ab = reservoir.Allocate(8 * 1024 * 1024);
+        Assert.Equal(externalBase, ab.Address);
+        Assert.True(reservoir.Free(ab));
+        Assert.True(reservoir.Free(c));
+        Assert.Equal(0UL, reservoir.ActiveAllocatedBytes);
+    }
 }

@@ -223,6 +223,12 @@ public sealed class DeviceMemoryPool : IVramAllocator
             _virtualReservoir.Free(ptr);
             return;
         }
+
+        if (_scratchWorkspace.Contains(ptr.Address))
+        {
+            _scratchWorkspace.Free(ptr);
+            return;
+        }
     }
 
     /// <inheritdoc/>

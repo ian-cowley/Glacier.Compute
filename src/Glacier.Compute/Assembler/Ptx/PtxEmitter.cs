@@ -6,11 +6,12 @@
 namespace Glacier.Compute.Assembler.Ptx;
 
 using System;
+using System.Globalization;
 using System.Text;
 
 /// <summary>
 /// High-performance NVIDIA PTX 8.0 JIT assembly generator.
-/// Generates compliant PTX 8.0 text for sm_80, sm_89, and sm_90 architectures.
+/// Generates compliant PTX 8.0 text for sm_80, sm_89, and sm_90 architectures with typed virtual register allocation.
 /// </summary>
 public static class PtxEmitter
 {
@@ -28,57 +29,188 @@ public static class PtxEmitter
     /// <returns>A valid PTX 8.0 assembly string.</returns>
     public static string Emit(ReadOnlySpan<Instruction> instructions, string kernelName = "glacier_compute_kernel", string targetArch = DefaultTargetArch)
     {
-        var sb = new StringBuilder(4096);
-        sb.AppendLine("// ===========================================================================");
-        sb.AppendLine("// Pure C# .NET 10 PTX 8.0 JIT Generator (Glacier.Compute.Assembler)");
-        sb.AppendLine("// ===========================================================================");
-        sb.AppendLine(".version 8.0");
-        sb.Append(".target ").AppendLine(targetArch);
-        sb.AppendLine(".address_size 64");
-        sb.AppendLine();
+        ArgumentException.ThrowIfNullOrWhiteSpace(kernelName);
+        ArgumentException.ThrowIfNullOrWhiteSpace(targetArch);
 
-        // Kernel signature
-        sb.Append(".visible .entry ").Append(kernelName).AppendLine("(");
-        sb.AppendLine("    .param .u64 param_input_a,");
-        sb.AppendLine("    .param .u64 param_input_b,");
-        sb.AppendLine("    .param .u64 param_output,");
-        sb.AppendLine("    .param .u32 param_n");
-        sb.AppendLine(")");
-        sb.AppendLine("{");
-
-        // Register allocations
-        sb.AppendLine("    .reg .pred %p<16>;");
-        sb.AppendLine("    .reg .b32  %r<64>;");
-        sb.AppendLine("    .reg .b64  %rd<32>;");
-        sb.AppendLine("    .reg .f32  %f<64>;");
-        sb.AppendLine("    .shared .align 4 .b8 smem_workspace[4096];");
-        sb.AppendLine();
-
-        // Parameter loading
-        sb.AppendLine("    // Load kernel parameters");
-        sb.AppendLine("    ld.param.u64 %rd1, [param_input_a];");
-        sb.AppendLine("    ld.param.u64 %rd2, [param_input_b];");
-        sb.AppendLine("    ld.param.u64 %rd3, [param_output];");
-        sb.AppendLine("    ld.param.u32 %r1,  [param_n];");
-        sb.AppendLine();
-
-        // Calculate thread indices
-        sb.AppendLine("    // Global thread index: gid = ctaid.x * ntid.x + tid.x");
-        sb.AppendLine("    mov.u32 %r2, %ctaid.x;");
-        sb.AppendLine("    mov.u32 %r3, %ntid.x;");
-        sb.AppendLine("    mov.u32 %r4, %tid.x;");
-        sb.AppendLine("    mad.lo.u32 %r5, %r2, %r3, %r4;");
-        sb.AppendLine();
-
-        // Bounds check
-        sb.AppendLine("    // Boundary guard");
-        sb.AppendLine("    setp.ge.u32 %p1, %r5, %r1;");
-        sb.AppendLine("    @%p1 bra KERNEL_EXIT;");
-        sb.AppendLine();
-
-        sb.AppendLine("    // Kernel Instruction Stream");
+        // Pre-scan all instructions (including after Return) to reject unknown opcodes and collect live virtual registers.
+        ulong usedFloatRegs = 0;
+        ulong usedUintRegs = 0;
+        bool usesShared = false;
+        bool usesShuffle = false;
+        bool usesGlobalMem = false;
+        bool scanTerminated = false;
 
         for (int i = 0; i < instructions.Length; i++)
+        {
+            var inst = instructions[i];
+            if (inst.Opcode < (int)ComputeOpcode.Nop || inst.Opcode > (int)ComputeOpcode.Return)
+            {
+                throw new NotSupportedException($"Unsupported ComputeOpcode '{inst.Opcode}' at instruction index {i} for PTX 8.0 emission.");
+            }
+
+            if (scanTerminated)
+            {
+                continue;
+            }
+
+            var opcode = (ComputeOpcode)inst.Opcode;
+            int a = Math.Clamp(inst.OperandA, 0, 63);
+            int b = Math.Clamp(inst.OperandB, 0, 63);
+            int d = Math.Clamp(inst.Destination, 0, 63);
+
+            switch (opcode)
+            {
+                case ComputeOpcode.Nop:
+                case ComputeOpcode.BarrierSync:
+                    break;
+
+                case ComputeOpcode.Add:
+                case ComputeOpcode.Sub:
+                case ComputeOpcode.Mul:
+                case ComputeOpcode.Div:
+                case ComputeOpcode.Fma:
+                case ComputeOpcode.Min:
+                case ComputeOpcode.Max:
+                    usedFloatRegs |= (1UL << a) | (1UL << b) | (1UL << d);
+                    break;
+
+                case ComputeOpcode.Neg:
+                case ComputeOpcode.Abs:
+                case ComputeOpcode.Sqrt:
+                case ComputeOpcode.Rsqrt:
+                case ComputeOpcode.Exp:
+                case ComputeOpcode.Log:
+                case ComputeOpcode.Tanh:
+                    usedFloatRegs |= (1UL << a) | (1UL << d);
+                    break;
+
+                case ComputeOpcode.LoadGlobal:
+                    usesGlobalMem = true;
+                    usedUintRegs |= (1UL << b);
+                    usedFloatRegs |= (1UL << d);
+                    break;
+
+                case ComputeOpcode.StoreGlobal:
+                    usesGlobalMem = true;
+                    usedFloatRegs |= (1UL << a);
+                    usedUintRegs |= (1UL << b);
+                    break;
+
+                case ComputeOpcode.LoadShared:
+                    usesShared = true;
+                    usedUintRegs |= (1UL << b);
+                    usedFloatRegs |= (1UL << d);
+                    break;
+
+                case ComputeOpcode.StoreShared:
+                    usesShared = true;
+                    usedFloatRegs |= (1UL << a);
+                    usedUintRegs |= (1UL << b);
+                    break;
+
+                case ComputeOpcode.LoadConstant:
+                    usedFloatRegs |= (1UL << d);
+                    usedUintRegs |= (1UL << d);
+                    break;
+
+                case ComputeOpcode.ShflSyncBfly:
+                    usesShuffle = true;
+                    usedFloatRegs |= (1UL << a) | (1UL << d);
+                    break;
+
+                case ComputeOpcode.LocalId:
+                case ComputeOpcode.GlobalId:
+                    usedUintRegs |= (1UL << d);
+                    usedFloatRegs |= (1UL << d);
+                    break;
+
+                case ComputeOpcode.AtomicAdd:
+                    usesGlobalMem = true;
+                    usedFloatRegs |= (1UL << a) | (1UL << d);
+                    usedUintRegs |= (1UL << b);
+                    break;
+
+                case ComputeOpcode.Return:
+                    scanTerminated = true;
+                    break;
+            }
+        }
+
+        Span<int> uintMap = stackalloc int[64];
+        Span<int> floatMap = stackalloc int[64];
+        var alloc = new PtxRegisterAllocator(uintMap, floatMap);
+
+        // 1. Reserve ABI parameter & thread-index registers first so virtual registers never collide.
+        int rdParamA = alloc.AllocRd();
+        int rdParamB = alloc.AllocRd();
+        int rdParamOut = alloc.AllocRd();
+
+        int rParamN = alloc.AllocR();
+        int rCtaId = alloc.AllocR();
+        int rNtid = alloc.AllocR();
+        int rTid = alloc.AllocR();
+        int rGid = alloc.AllocR();
+
+        int pExitGuard = alloc.AllocPred();
+
+        // 2. Allocate dedicated non-clobbering scratch registers for memory/shuffle lowering.
+        int pMemGuard = (usesGlobalMem || usesShared) ? alloc.AllocPred() : -1;
+        int rShflIn = usesShuffle ? alloc.AllocR() : -1;
+        int rShflOut = usesShuffle ? alloc.AllocR() : -1;
+        int rdByteOffset = (usesGlobalMem || usesShared) ? alloc.AllocRd() : -1;
+        int rdAddr = (usesGlobalMem || usesShared) ? alloc.AllocRd() : -1;
+        int rdSmemBase = usesShared ? alloc.AllocRd() : -1;
+
+        var bodySb = new StringBuilder(2048);
+
+        // Parameter loading
+        bodySb.AppendLine("    // Load kernel parameters");
+        bodySb.Append("    ld.param.u64 %rd").Append(rdParamA).AppendLine(", [param_input_a];");
+        bodySb.Append("    ld.param.u64 %rd").Append(rdParamB).AppendLine(", [param_input_b];");
+        bodySb.Append("    ld.param.u64 %rd").Append(rdParamOut).AppendLine(", [param_output];");
+        bodySb.Append("    ld.param.u32 %r").Append(rParamN).AppendLine(", [param_n];");
+        bodySb.AppendLine();
+
+        // Thread index calculation
+        bodySb.AppendLine("    // Global thread index: gid = ctaid.x * ntid.x + tid.x");
+        bodySb.Append("    mov.u32 %r").Append(rCtaId).AppendLine(", %ctaid.x;");
+        bodySb.Append("    mov.u32 %r").Append(rNtid).AppendLine(", %ntid.x;");
+        bodySb.Append("    mov.u32 %r").Append(rTid).AppendLine(", %tid.x;");
+        bodySb.Append("    mad.lo.u32 %r").Append(rGid).Append(", %r").Append(rCtaId).Append(", %r").Append(rNtid).Append(", %r").Append(rTid).AppendLine(";");
+        bodySb.AppendLine();
+
+        // Bounds check
+        bodySb.AppendLine("    // Boundary guard");
+        bodySb.Append("    setp.ge.u32 %p").Append(pExitGuard).Append(", %r").Append(rGid).Append(", %r").Append(rParamN).AppendLine(";");
+        bodySb.Append("    @%p").Append(pExitGuard).AppendLine(" bra KERNEL_EXIT;");
+        bodySb.AppendLine();
+
+        // Pre-allocate and zero-initialize live typed virtual registers
+        if (usedUintRegs != 0 || usedFloatRegs != 0)
+        {
+            bodySb.AppendLine("    // Initialize live typed virtual registers");
+            for (int r = 0; r < 64; r++)
+            {
+                if ((usedUintRegs & (1UL << r)) != 0)
+                {
+                    int physR = alloc.GetOrAllocUint(r);
+                    bodySb.Append("    mov.u32 %r").Append(physR).AppendLine(", 0;");
+                }
+
+                if ((usedFloatRegs & (1UL << r)) != 0)
+                {
+                    int physF = alloc.GetOrAllocFloat(r);
+                    bodySb.Append("    mov.f32 %f").Append(physF).AppendLine(", 0f00000000;");
+                }
+            }
+
+            bodySb.AppendLine();
+        }
+
+        bodySb.AppendLine("    // Kernel Instruction Stream");
+
+        bool terminated = false;
+        for (int i = 0; i < instructions.Length && !terminated; i++)
         {
             var inst = instructions[i];
             var opcode = (ComputeOpcode)inst.Opcode;
@@ -89,144 +221,331 @@ public static class PtxEmitter
             switch (opcode)
             {
                 case ComputeOpcode.Nop:
-                    sb.AppendLine("    nop;");
+                    bodySb.AppendLine("    nop;");
                     break;
 
                 case ComputeOpcode.Add:
-                    sb.Append("    add.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    add.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Sub:
-                    sb.Append("    sub.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    sub.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Mul:
-                    sb.Append("    mul.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    mul.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Div:
-                    sb.Append("    div.rn.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    div.rn.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Fma:
-                    sb.Append("    fma.rn.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).Append(", %f").Append(d).AppendLine(";");
+                    bodySb.Append("    fma.rn.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).Append(", %f").Append(alloc.GetFloat(d)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Neg:
-                    sb.Append("    neg.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    bodySb.Append("    neg.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Abs:
-                    sb.Append("    abs.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    bodySb.Append("    abs.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Min:
-                    sb.Append("    min.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    min.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Max:
-                    sb.Append("    max.f32 %f").Append(d).Append(", %f").Append(a).Append(", %f").Append(b).AppendLine(";");
+                    bodySb.Append("    max.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).Append(", %f").Append(alloc.GetFloat(b)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Sqrt:
-                    sb.Append("    sqrt.rn.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    bodySb.Append("    sqrt.rn.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Rsqrt:
-                    sb.Append("    rsqrt.approx.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    bodySb.Append("    rsqrt.approx.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.Exp:
-                    sb.Append("    mul.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(", 0f3FB8AA3B;");
-                    sb.Append("    ex2.approx.f32 %f").Append(d).Append(", %f").Append(d).AppendLine(";");
-                    break;
+                    {
+                        int fA = alloc.GetFloat(a);
+                        int fD = alloc.GetFloat(d);
+                        bodySb.Append("    mul.f32 %f").Append(fD).Append(", %f").Append(fA).AppendLine(", 0f3FB8AA3B;");
+                        bodySb.Append("    ex2.approx.f32 %f").Append(fD).Append(", %f").Append(fD).AppendLine(";");
+                        break;
+                    }
 
                 case ComputeOpcode.Log:
-                    sb.Append("    lg2.approx.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
-                    sb.Append("    mul.f32 %f").Append(d).Append(", %f").Append(d).AppendLine(", 0f3F317218;");
-                    break;
+                    {
+                        int fA = alloc.GetFloat(a);
+                        int fD = alloc.GetFloat(d);
+                        bodySb.Append("    lg2.approx.f32 %f").Append(fD).Append(", %f").Append(fA).AppendLine(";");
+                        bodySb.Append("    mul.f32 %f").Append(fD).Append(", %f").Append(fD).AppendLine(", 0f3F317218;");
+                        break;
+                    }
 
                 case ComputeOpcode.Tanh:
-                    sb.Append("    tanh.approx.f32 %f").Append(d).Append(", %f").Append(a).AppendLine(";");
+                    bodySb.Append("    tanh.approx.f32 %f").Append(alloc.GetFloat(d)).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
                     break;
 
                 case ComputeOpcode.LoadGlobal:
-                {
-                    string basePtrReg = inst.OperandA switch
                     {
-                        1 => "%rd2",
-                        2 => "%rd3",
-                        _ => "%rd1"
-                    };
-                    sb.Append("    mul.wide.u32 %rd10, %r").Append(b).AppendLine(", 4;");
-                    sb.Append("    add.u64 %rd11, ").Append(basePtrReg).AppendLine(", %rd10;");
-                    sb.Append("    ld.global.f32 %f").Append(d).AppendLine(", [%rd11];");
-                    break;
-                }
+                        int bufIdx = Math.Clamp(inst.OperandA, 0, 2);
+                        int basePtrReg = bufIdx switch
+                        {
+                            1 => rdParamB,
+                            2 => rdParamOut,
+                            _ => rdParamA
+                        };
+                        int rIdx = alloc.GetUint(b);
+                        int fDest = alloc.GetFloat(d);
+
+                        bodySb.Append("    setp.ge.u32 %p").Append(pMemGuard).Append(", %r").Append(rIdx).Append(", %r").Append(rParamN).AppendLine(";");
+                        bodySb.Append("    mul.wide.u32 %rd").Append(rdByteOffset).Append(", %r").Append(rIdx).AppendLine(", 4;");
+                        bodySb.Append("    add.u64 %rd").Append(rdAddr).Append(", %rd").Append(basePtrReg).Append(", %rd").Append(rdByteOffset).AppendLine(";");
+                        bodySb.Append("    @!%p").Append(pMemGuard).Append(" ld.global.f32 %f").Append(fDest).Append(", [%rd").Append(rdAddr).AppendLine("];");
+                        bodySb.Append("    @%p").Append(pMemGuard).Append(" mov.f32 %f").Append(fDest).AppendLine(", 0f00000000;");
+                        break;
+                    }
 
                 case ComputeOpcode.StoreGlobal:
-                    sb.Append("    mul.wide.u32 %rd12, %r").Append(b).AppendLine(", 4;");
-                    sb.AppendLine("    add.u64 %rd13, %rd3, %rd12;");
-                    sb.Append("    st.global.f32 [%rd13], %f").Append(a).AppendLine(";");
-                    break;
+                    {
+                        int rIdx = alloc.GetUint(b);
+                        int fSrc = alloc.GetFloat(a);
+
+                        bodySb.Append("    setp.ge.u32 %p").Append(pMemGuard).Append(", %r").Append(rIdx).Append(", %r").Append(rParamN).AppendLine(";");
+                        bodySb.Append("    mul.wide.u32 %rd").Append(rdByteOffset).Append(", %r").Append(rIdx).AppendLine(", 4;");
+                        bodySb.Append("    add.u64 %rd").Append(rdAddr).Append(", %rd").Append(rdParamOut).Append(", %rd").Append(rdByteOffset).AppendLine(";");
+                        bodySb.Append("    @!%p").Append(pMemGuard).Append(" st.global.f32 [%rd").Append(rdAddr).Append("], %f").Append(fSrc).AppendLine(";");
+                        break;
+                    }
 
                 case ComputeOpcode.LoadShared:
-                    sb.Append("    mul.wide.u32 %rd14, %r").Append(b).AppendLine(", 4;");
-                    sb.AppendLine("    mov.u64 %rd15, smem_workspace;");
-                    sb.AppendLine("    add.u64 %rd16, %rd15, %rd14;");
-                    sb.Append("    ld.shared.f32 %f").Append(d).AppendLine(", [%rd16];");
-                    break;
+                    {
+                        int rIdx = alloc.GetUint(b);
+                        int fDest = alloc.GetFloat(d);
+
+                        bodySb.Append("    setp.ge.u32 %p").Append(pMemGuard).Append(", %r").Append(rIdx).AppendLine(", 1024;");
+                        bodySb.Append("    mul.wide.u32 %rd").Append(rdByteOffset).Append(", %r").Append(rIdx).AppendLine(", 4;");
+                        bodySb.Append("    mov.u64 %rd").Append(rdSmemBase).AppendLine(", smem_workspace;");
+                        bodySb.Append("    add.u64 %rd").Append(rdAddr).Append(", %rd").Append(rdSmemBase).Append(", %rd").Append(rdByteOffset).AppendLine(";");
+                        bodySb.Append("    @!%p").Append(pMemGuard).Append(" ld.shared.f32 %f").Append(fDest).Append(", [%rd").Append(rdAddr).AppendLine("];");
+                        bodySb.Append("    @%p").Append(pMemGuard).Append(" mov.f32 %f").Append(fDest).AppendLine(", 0f00000000;");
+                        break;
+                    }
 
                 case ComputeOpcode.StoreShared:
-                    sb.Append("    mul.wide.u32 %rd17, %r").Append(b).AppendLine(", 4;");
-                    sb.AppendLine("    mov.u64 %rd18, smem_workspace;");
-                    sb.AppendLine("    add.u64 %rd19, %rd18, %rd17;");
-                    sb.Append("    st.shared.f32 [%rd19], %f").Append(a).AppendLine(";");
-                    break;
+                    {
+                        int rIdx = alloc.GetUint(b);
+                        int fSrc = alloc.GetFloat(a);
+
+                        bodySb.Append("    setp.ge.u32 %p").Append(pMemGuard).Append(", %r").Append(rIdx).AppendLine(", 1024;");
+                        bodySb.Append("    mul.wide.u32 %rd").Append(rdByteOffset).Append(", %r").Append(rIdx).AppendLine(", 4;");
+                        bodySb.Append("    mov.u64 %rd").Append(rdSmemBase).AppendLine(", smem_workspace;");
+                        bodySb.Append("    add.u64 %rd").Append(rdAddr).Append(", %rd").Append(rdSmemBase).Append(", %rd").Append(rdByteOffset).AppendLine(";");
+                        bodySb.Append("    @!%p").Append(pMemGuard).Append(" st.shared.f32 [%rd").Append(rdAddr).Append("], %f").Append(fSrc).AppendLine(";");
+                        break;
+                    }
 
                 case ComputeOpcode.LoadConstant:
-                    sb.Append("    mov.f32 %f").Append(d).Append(", 0f").Append(((uint)inst.OperandA).ToString("X8", System.Globalization.CultureInfo.InvariantCulture)).AppendLine(";");
-                    break;
+                    {
+                        uint bits = (uint)inst.OperandA;
+                        if ((usedFloatRegs & (1UL << d)) != 0)
+                        {
+                            bodySb.Append("    mov.f32 %f").Append(alloc.GetFloat(d)).Append(", 0f").Append(bits.ToString("X8", CultureInfo.InvariantCulture)).AppendLine(";");
+                        }
+
+                        if ((usedUintRegs & (1UL << d)) != 0)
+                        {
+                            bodySb.Append("    mov.u32 %r").Append(alloc.GetUint(d)).Append(", 0x").Append(bits.ToString("X8", CultureInfo.InvariantCulture)).AppendLine(";");
+                        }
+
+                        break;
+                    }
 
                 case ComputeOpcode.ShflSyncBfly:
-                    int laneMask = inst.OperandB != 0 ? inst.OperandB : 16;
-                    sb.Append("    mov.b32 %r60, %f").Append(a).AppendLine(";");
-                    sb.Append("    shfl.sync.bfly.b32 %r61, %r60, ").Append(laneMask).AppendLine(", 0x1f, 0xffffffff;");
-                    sb.Append("    mov.b32 %f").Append(d).AppendLine(", %r61;");
-                    break;
+                    {
+                        int laneMask = inst.OperandB != 0 ? inst.OperandB : 16;
+                        bodySb.Append("    mov.b32 %r").Append(rShflIn).Append(", %f").Append(alloc.GetFloat(a)).AppendLine(";");
+                        bodySb.Append("    shfl.sync.bfly.b32 %r").Append(rShflOut).Append(", %r").Append(rShflIn).Append(", ").Append(laneMask).AppendLine(", 0x1f, 0xffffffff;");
+                        bodySb.Append("    mov.b32 %f").Append(alloc.GetFloat(d)).Append(", %r").Append(rShflOut).AppendLine(";");
+                        break;
+                    }
 
                 case ComputeOpcode.BarrierSync:
-                    sb.AppendLine("    bar.sync 0;");
+                    bodySb.AppendLine("    bar.sync 0;");
                     break;
 
                 case ComputeOpcode.LocalId:
-                    sb.Append("    mov.u32 %r").Append(d).AppendLine(", %tid.x;");
-                    break;
+                    {
+                        int rDest = alloc.GetUint(d);
+                        bodySb.Append("    mov.u32 %r").Append(rDest).AppendLine(", %tid.x;");
+                        if ((usedFloatRegs & (1UL << d)) != 0)
+                        {
+                            bodySb.Append("    cvt.rn.f32.u32 %f").Append(alloc.GetFloat(d)).Append(", %r").Append(rDest).AppendLine(";");
+                        }
+
+                        break;
+                    }
 
                 case ComputeOpcode.GlobalId:
-                    sb.Append("    mov.u32 %r").Append(d).AppendLine(", %r5;");
-                    break;
+                    {
+                        int rDest = alloc.GetUint(d);
+                        bodySb.Append("    mov.u32 %r").Append(rDest).Append(", %r").Append(rGid).AppendLine(";");
+                        if ((usedFloatRegs & (1UL << d)) != 0)
+                        {
+                            bodySb.Append("    cvt.rn.f32.u32 %f").Append(alloc.GetFloat(d)).Append(", %r").Append(rDest).AppendLine(";");
+                        }
+
+                        break;
+                    }
 
                 case ComputeOpcode.AtomicAdd:
-                    sb.Append("    mul.wide.u32 %rd20, %r").Append(b).AppendLine(", 4;");
-                    sb.AppendLine("    add.u64 %rd21, %rd3, %rd20;");
-                    sb.Append("    atom.global.add.f32 %f").Append(d).Append(", [%rd21], %f").Append(a).AppendLine(";");
-                    break;
+                    {
+                        int rIdx = alloc.GetUint(b);
+                        int fSrc = alloc.GetFloat(a);
+                        int fDest = alloc.GetFloat(d);
+
+                        bodySb.Append("    setp.ge.u32 %p").Append(pMemGuard).Append(", %r").Append(rIdx).Append(", %r").Append(rParamN).AppendLine(";");
+                        bodySb.Append("    mul.wide.u32 %rd").Append(rdByteOffset).Append(", %r").Append(rIdx).AppendLine(", 4;");
+                        bodySb.Append("    add.u64 %rd").Append(rdAddr).Append(", %rd").Append(rdParamOut).Append(", %rd").Append(rdByteOffset).AppendLine(";");
+                        bodySb.Append("    @!%p").Append(pMemGuard).Append(" atom.global.add.f32 %f").Append(fDest).Append(", [%rd").Append(rdAddr).Append("], %f").Append(fSrc).AppendLine(";");
+                        bodySb.Append("    @%p").Append(pMemGuard).Append(" mov.f32 %f").Append(fDest).AppendLine(", 0f00000000;");
+                        break;
+                    }
 
                 case ComputeOpcode.Return:
-                    sb.AppendLine("    bra KERNEL_EXIT;");
+                    bodySb.AppendLine("    bra KERNEL_EXIT;");
+                    terminated = true;
                     break;
 
                 default:
-                    sb.Append("    // Unsupported opcode: ").AppendLine(inst.Opcode.ToString());
-                    break;
+                    throw new NotSupportedException($"Unsupported ComputeOpcode '{inst.Opcode}' for PTX 8.0 emission.");
             }
         }
 
+        bodySb.AppendLine();
+        bodySb.AppendLine("KERNEL_EXIT:");
+        bodySb.AppendLine("    ret;");
+        bodySb.AppendLine("}");
+
+        // Assemble final PTX with exact emitted register counts.
+        var sb = new StringBuilder(bodySb.Length + 512);
+        sb.AppendLine("// ===========================================================================");
+        sb.AppendLine("// Pure C# .NET 10 PTX 8.0 JIT Generator (Glacier.Compute.Assembler)");
+        sb.AppendLine("// ===========================================================================");
+        sb.AppendLine(".version 8.0");
+        sb.Append(".target ").AppendLine(targetArch);
+        sb.AppendLine(".address_size 64");
         sb.AppendLine();
-        sb.AppendLine("KERNEL_EXIT:");
-        sb.AppendLine("    ret;");
-        sb.AppendLine("}");
+
+        sb.Append(".visible .entry ").Append(kernelName).AppendLine("(");
+        sb.AppendLine("    .param .u64 param_input_a,");
+        sb.AppendLine("    .param .u64 param_input_b,");
+        sb.AppendLine("    .param .u64 param_output,");
+        sb.AppendLine("    .param .u32 param_n");
+        sb.AppendLine(")");
+        sb.AppendLine("{");
+
+        sb.Append("    .reg .pred %p<").Append(alloc.PredCount).AppendLine(">;");
+        sb.Append("    .reg .b32  %r<").Append(alloc.RCount).AppendLine(">;");
+        sb.Append("    .reg .b64  %rd<").Append(alloc.RdCount).AppendLine(">;");
+        if (alloc.FCount > 0)
+        {
+            sb.Append("    .reg .f32  %f<").Append(alloc.FCount).AppendLine(">;");
+        }
+
+        if (alloc.FdCount > 0)
+        {
+            sb.Append("    .reg .f64  %fd<").Append(alloc.FdCount).AppendLine(">;");
+        }
+
+        if (usesShared)
+        {
+            sb.AppendLine("    .shared .align 4 .b8 smem_workspace[4096];");
+        }
+
+        sb.AppendLine();
+        sb.Append(bodySb);
         return sb.ToString();
+    }
+
+    private ref struct PtxRegisterAllocator
+    {
+        private readonly Span<int> _uintMap;
+        private readonly Span<int> _floatMap;
+        private int _predCount;
+        private int _rCount;
+        private int _rdCount;
+        private int _fCount;
+        private int _fdCount;
+
+        public PtxRegisterAllocator(Span<int> uintMap, Span<int> floatMap)
+        {
+            _uintMap = uintMap;
+            _floatMap = floatMap;
+            _uintMap.Fill(-1);
+            _floatMap.Fill(-1);
+        }
+
+        public readonly int PredCount => _predCount;
+        public readonly int RCount => _rCount;
+        public readonly int RdCount => _rdCount;
+        public readonly int FCount => _fCount;
+        public readonly int FdCount => _fdCount;
+
+        public int AllocPred() => _predCount++;
+        public int AllocR() => _rCount++;
+        public int AllocRd() => _rdCount++;
+        public int AllocF() => _fCount++;
+        public int AllocFd() => _fdCount++;
+
+        public int GetOrAllocUint(int vreg)
+        {
+            int idx = _uintMap[vreg];
+            if (idx < 0)
+            {
+                idx = AllocR();
+                _uintMap[vreg] = idx;
+            }
+
+            return idx;
+        }
+
+        public int GetOrAllocFloat(int vreg)
+        {
+            int idx = _floatMap[vreg];
+            if (idx < 0)
+            {
+                idx = AllocF();
+                _floatMap[vreg] = idx;
+            }
+
+            return idx;
+        }
+
+        public readonly int GetUint(int vreg)
+        {
+            int idx = _uintMap[vreg];
+            if (idx < 0)
+            {
+                throw new InvalidOperationException($"Virtual uint register r{vreg} was referenced without being allocated.");
+            }
+
+            return idx;
+        }
+
+        public readonly int GetFloat(int vreg)
+        {
+            int idx = _floatMap[vreg];
+            if (idx < 0)
+            {
+                throw new InvalidOperationException($"Virtual float register f{vreg} was referenced without being allocated.");
+            }
+
+            return idx;
+        }
     }
 }

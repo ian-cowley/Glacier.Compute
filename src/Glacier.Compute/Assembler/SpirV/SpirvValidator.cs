@@ -63,6 +63,7 @@ public static class SpirvValidator
         bool inBlock = false;
         bool blockTerminated = false;
         bool hasBlocks = false;
+        bool expectMergeTerminator = false;
 
         while (offset < spirvBytes.Length)
         {
@@ -95,6 +96,17 @@ public static class SpirvValidator
             if (!ValidateInstructionIds(opcode, wordCount, instBytes, bound, wordOffset, out errorMessage))
             {
                 return false;
+            }
+
+            if (expectMergeTerminator)
+            {
+                if (opcode != SpirvOpcode.OpBranchConditional && opcode != SpirvOpcode.OpSwitch)
+                {
+                    errorMessage = $"OpSelectionMerge at word index {wordOffset} must be immediately followed by OpBranchConditional or OpSwitch (found opcode {opcode}).";
+                    return false;
+                }
+
+                expectMergeTerminator = false;
             }
 
             // Validate function & basic-block single-termination CFG invariants
@@ -177,6 +189,11 @@ public static class SpirvValidator
                     {
                         errorMessage = $"Unreachable instruction (opcode {opcode}) emitted after block terminator at word index {wordOffset}.";
                         return false;
+                    }
+
+                    if (opcode == SpirvOpcode.OpSelectionMerge)
+                    {
+                        expectMergeTerminator = true;
                     }
                 }
             }
@@ -380,6 +397,25 @@ public static class SpirvValidator
                     }
                 }
                 return true;
+
+            case SpirvOpcode.OpSelectionMerge:
+                if (wordCount < 3)
+                {
+                    errorMessage = $"OpSelectionMerge truncated at word index {wordOffset}.";
+                    return false;
+                }
+                return CheckId(ReadWord(instBytes, 1), bound, opcode, wordOffset + 1, out errorMessage);
+
+            case SpirvOpcode.OpUGreaterThanEqual:
+                if (wordCount < 5)
+                {
+                    errorMessage = $"OpUGreaterThanEqual truncated at word index {wordOffset}.";
+                    return false;
+                }
+                return CheckId(ReadWord(instBytes, 1), bound, opcode, wordOffset + 1, out errorMessage)
+                    && CheckId(ReadWord(instBytes, 2), bound, opcode, wordOffset + 2, out errorMessage)
+                    && CheckId(ReadWord(instBytes, 3), bound, opcode, wordOffset + 3, out errorMessage)
+                    && CheckId(ReadWord(instBytes, 4), bound, opcode, wordOffset + 4, out errorMessage);
 
             case SpirvOpcode.OpTypeStruct:
             case SpirvOpcode.OpTypeFunction:

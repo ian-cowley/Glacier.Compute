@@ -99,4 +99,24 @@ public class SlabAllocatorTests
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(0));
         Assert.Throws<ArgumentOutOfRangeException>(() => allocator.Allocate(65537));
     }
+
+    [Theory]
+    [InlineData(0)]
+    [InlineData(-1)]
+    [InlineData(-64)]
+    [InlineData(int.MaxValue)]
+    public void SlabAllocator_ThrowsArgumentOutOfRange_OnNonPositiveOrOverflowSlotsPerBin(int slotsPerBin)
+    {
+        Assert.Throws<ArgumentOutOfRangeException>(() => new SlabAllocator(slotsPerBin));
+    }
+
+    [Theory]
+    [InlineData(1)]
+    [InlineData(63)]
+    [InlineData(65)]
+    [InlineData(100)]
+    public void SlabAllocator_ThrowsArgumentException_OnNonMultipleOf64SlotsPerBin(int slotsPerBin)
+    {
+        Assert.Throws<ArgumentException>(() => new SlabAllocator(slotsPerBin));
+    }
 }

@@ -6,15 +6,16 @@
 namespace Glacier.Compute.Assembler.SpirV;
 
 using System;
+using System.Buffers;
 using System.Buffers.Binary;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Text;
 
 /// <summary>
-/// Pure C# .NET 10 binary emitter for SPIR-V 1.6 compute and graphics bytecode.
+/// Pure C# .NET 10 binary emitter for SPIR-V 1.6 compute shader bytecode.
 /// Directly emits spec-compliant 32-bit SPIR-V words with <c>StorageBuffer</c> descriptor bindings,
-/// <c>PushConstant</c> element bounds, <c>Workgroup</c> shared memory, and <c>GLSL.std.450</c> math intrinsics.
+/// <c>PushConstant</c> element bounds guards, <c>Workgroup</c> shared memory, and <c>GLSL.std.450</c> math intrinsics.
 /// </summary>
 public sealed class SpirvBinaryEmitter
 {
@@ -193,9 +194,14 @@ public sealed class SpirvBinaryEmitter
 
     private void BuildModuleWords(ShaderStage stage, ReadOnlySpan<Instruction> instructions, uint localSizeX, uint localSizeY, uint localSizeZ)
     {
+        if (stage != ShaderStage.Compute)
+        {
+            throw new NotSupportedException(
+                $"ShaderStage.{stage} is not supported by SpirvBinaryEmitter; only ShaderStage.Compute is supported.");
+        }
+
         Reset();
 
-        bool isCompute = stage == ShaderStage.Compute;
         bool usesShuffle = false;
         bool usesAtomicFloatAdd = false;
         bool usesShared = false;
@@ -217,24 +223,6 @@ public sealed class SpirvBinaryEmitter
             int a = Math.Clamp(inst.OperandA, 0, 63);
             int b = Math.Clamp(inst.OperandB, 0, 63);
             int d = Math.Clamp(inst.Destination, 0, 63);
-
-            // Validate stage constraints even on unreachable instructions so invalid IR is never silently ignored
-            switch (opcode)
-            {
-                case ComputeOpcode.LocalId:
-                case ComputeOpcode.GlobalId:
-                case ComputeOpcode.LoadGlobal:
-                case ComputeOpcode.StoreGlobal:
-                case ComputeOpcode.LoadShared:
-                case ComputeOpcode.StoreShared:
-                case ComputeOpcode.BarrierSync:
-                case ComputeOpcode.AtomicAdd:
-                    if (!isCompute)
-                    {
-                        throw new NotSupportedException($"ComputeOpcode.{opcode} at instruction index {i} is only supported in ShaderStage.Compute (current stage: {stage}).");
-                    }
-                    break;
-            }
 
             if (scanTerminated)
             {
@@ -383,51 +371,30 @@ public sealed class SpirvBinaryEmitter
         // -------------------------------------------------------------------
         uint entryPointId = NextId();
 
-        uint globalInvIdVar = 0;
-        uint localInvIdVar = 0;
+        uint globalInvIdVar = NextId();
+        uint localInvIdVar = NextId();
         Span<uint> storageBufferVars = stackalloc uint[3];
-        uint pushConstVar = 0;
-        uint sharedMemVar = 0;
-
-        if (isCompute)
-        {
-            globalInvIdVar = NextId();
-            localInvIdVar = NextId();
-            storageBufferVars[0] = NextId();
-            storageBufferVars[1] = NextId();
-            storageBufferVars[2] = NextId();
-            pushConstVar = NextId();
-            if (usesShared)
-            {
-                sharedMemVar = NextId();
-            }
-        }
-
-        uint execModel = stage switch
-        {
-            ShaderStage.Vertex => SpirvOpcode.ExecutionModelVertex,
-            ShaderStage.Pixel => SpirvOpcode.ExecutionModelFragment,
-            _ => SpirvOpcode.ExecutionModelGLCompute
-        };
+        storageBufferVars[0] = NextId();
+        storageBufferVars[1] = NextId();
+        storageBufferVars[2] = NextId();
+        uint pushConstVar = NextId();
+        uint sharedMemVar = usesShared ? NextId() : 0;
 
         _scratchOperands.Clear();
-        _scratchOperands.Add(execModel);
+        _scratchOperands.Add(SpirvOpcode.ExecutionModelGLCompute);
         _scratchOperands.Add(entryPointId);
         AppendStringWords("main", _scratchOperands);
 
-        if (isCompute)
+        // SPIR-V 1.4+ / 1.6 requires all module-scope OpVariables in the entry-point interface list
+        _scratchOperands.Add(globalInvIdVar);
+        _scratchOperands.Add(localInvIdVar);
+        _scratchOperands.Add(storageBufferVars[0]);
+        _scratchOperands.Add(storageBufferVars[1]);
+        _scratchOperands.Add(storageBufferVars[2]);
+        _scratchOperands.Add(pushConstVar);
+        if (usesShared)
         {
-            // SPIR-V 1.4+ / 1.6 requires all module-scope OpVariables in the entry-point interface list
-            _scratchOperands.Add(globalInvIdVar);
-            _scratchOperands.Add(localInvIdVar);
-            _scratchOperands.Add(storageBufferVars[0]);
-            _scratchOperands.Add(storageBufferVars[1]);
-            _scratchOperands.Add(storageBufferVars[2]);
-            _scratchOperands.Add(pushConstVar);
-            if (usesShared)
-            {
-                _scratchOperands.Add(sharedMemVar);
-            }
+            _scratchOperands.Add(sharedMemVar);
         }
 
         EmitInstruction(SpirvOpcode.OpEntryPoint, CollectionsMarshal.AsSpan(_scratchOperands));
@@ -435,48 +402,34 @@ public sealed class SpirvBinaryEmitter
         // -------------------------------------------------------------------
         // 7. Execution Modes
         // -------------------------------------------------------------------
-        if (isCompute)
-        {
-            EmitInstruction(SpirvOpcode.OpExecutionMode, entryPointId, SpirvOpcode.ExecutionModeLocalSize, localSizeX, localSizeY, localSizeZ);
-        }
-        else if (stage == ShaderStage.Pixel)
-        {
-            EmitInstruction(SpirvOpcode.OpExecutionMode, entryPointId, SpirvOpcode.ExecutionModeOriginUpperLeft);
-        }
+        EmitInstruction(SpirvOpcode.OpExecutionMode, entryPointId, SpirvOpcode.ExecutionModeLocalSize, localSizeX, localSizeY, localSizeZ);
 
         // -------------------------------------------------------------------
         // 8. Annotations / Decorations
         // -------------------------------------------------------------------
-        uint runtimeArrayFloatTypeId = 0;
-        uint storageStructTypeId = 0;
-        uint pushConstStructTypeId = 0;
+        uint runtimeArrayFloatTypeId = NextId();
+        uint storageStructTypeId = NextId();
+        uint pushConstStructTypeId = NextId();
 
-        if (isCompute)
+        // Built-in invocation IDs (Compute stage)
+        EmitInstruction(SpirvOpcode.OpDecorate, globalInvIdVar, SpirvOpcode.DecorationBuiltIn, SpirvOpcode.BuiltInGlobalInvocationId);
+        EmitInstruction(SpirvOpcode.OpDecorate, localInvIdVar, SpirvOpcode.DecorationBuiltIn, SpirvOpcode.BuiltInLocalInvocationId);
+
+        // StorageBuffer layout: struct { float data[]; } with ArrayStride = 4, Offset = 0
+        EmitInstruction(SpirvOpcode.OpDecorate, runtimeArrayFloatTypeId, SpirvOpcode.DecorationArrayStride, 4);
+        EmitInstruction(SpirvOpcode.OpDecorate, storageStructTypeId, SpirvOpcode.DecorationBlock);
+        EmitInstruction(SpirvOpcode.OpMemberDecorate, storageStructTypeId, 0, SpirvOpcode.DecorationOffset, 0);
+
+        // Descriptor bindings: set=0, binding=0..2 (input_a, input_b, output)
+        for (uint binding = 0; binding < 3; binding++)
         {
-            runtimeArrayFloatTypeId = NextId();
-            storageStructTypeId = NextId();
-            pushConstStructTypeId = NextId();
-
-            // Built-in invocation IDs (strictly guarded to Compute stage)
-            EmitInstruction(SpirvOpcode.OpDecorate, globalInvIdVar, SpirvOpcode.DecorationBuiltIn, SpirvOpcode.BuiltInGlobalInvocationId);
-            EmitInstruction(SpirvOpcode.OpDecorate, localInvIdVar, SpirvOpcode.DecorationBuiltIn, SpirvOpcode.BuiltInLocalInvocationId);
-
-            // StorageBuffer layout: struct { float data[]; } with ArrayStride = 4, Offset = 0
-            EmitInstruction(SpirvOpcode.OpDecorate, runtimeArrayFloatTypeId, SpirvOpcode.DecorationArrayStride, 4);
-            EmitInstruction(SpirvOpcode.OpDecorate, storageStructTypeId, SpirvOpcode.DecorationBlock);
-            EmitInstruction(SpirvOpcode.OpMemberDecorate, storageStructTypeId, 0, SpirvOpcode.DecorationOffset, 0);
-
-            // Descriptor bindings: set=0, binding=0..2 (input_a, input_b, output)
-            for (uint binding = 0; binding < 3; binding++)
-            {
-                EmitInstruction(SpirvOpcode.OpDecorate, storageBufferVars[(int)binding], SpirvOpcode.DecorationDescriptorSet, 0);
-                EmitInstruction(SpirvOpcode.OpDecorate, storageBufferVars[(int)binding], SpirvOpcode.DecorationBinding, binding);
-            }
-
-            // PushConstant layout: struct { uint param_n; } at Offset = 0
-            EmitInstruction(SpirvOpcode.OpDecorate, pushConstStructTypeId, SpirvOpcode.DecorationBlock);
-            EmitInstruction(SpirvOpcode.OpMemberDecorate, pushConstStructTypeId, 0, SpirvOpcode.DecorationOffset, 0);
+            EmitInstruction(SpirvOpcode.OpDecorate, storageBufferVars[(int)binding], SpirvOpcode.DecorationDescriptorSet, 0);
+            EmitInstruction(SpirvOpcode.OpDecorate, storageBufferVars[(int)binding], SpirvOpcode.DecorationBinding, binding);
         }
+
+        // PushConstant layout: struct { uint param_n; } at Offset = 0
+        EmitInstruction(SpirvOpcode.OpDecorate, pushConstStructTypeId, SpirvOpcode.DecorationBlock);
+        EmitInstruction(SpirvOpcode.OpMemberDecorate, pushConstStructTypeId, 0, SpirvOpcode.DecorationOffset, 0);
 
         // -------------------------------------------------------------------
         // 9. Types, Constants, and Module-Scope Variables
@@ -485,11 +438,13 @@ public sealed class SpirvBinaryEmitter
         uint funcTypeId = NextId();
         uint floatTypeId = NextId();
         uint uintTypeId = NextId();
+        uint boolTypeId = NextId();
 
         EmitInstruction(SpirvOpcode.OpTypeVoid, voidTypeId);
         EmitInstruction(SpirvOpcode.OpTypeFunction, funcTypeId, voidTypeId);
         EmitInstruction(SpirvOpcode.OpTypeFloat, floatTypeId, 32);
         EmitInstruction(SpirvOpcode.OpTypeInt, uintTypeId, 32, 0);
+        EmitInstruction(SpirvOpcode.OpTypeBool, boolTypeId);
 
         // Always emit canonical zero constants for float and uint
         uint constFloatZeroId = GetOrEmitFloatConstant(floatTypeId, 0u);
@@ -503,31 +458,59 @@ public sealed class SpirvBinaryEmitter
         // Materialize all pre-scanned constants before OpFunction
         if (_floatConstants.Count > 1)
         {
-            Span<uint> keys = stackalloc uint[_floatConstants.Count];
-            int k = 0;
-            foreach (var kvp in _floatConstants)
+            int count = _floatConstants.Count;
+            uint[]? rented = null;
+            Span<uint> keys = count <= 128
+                ? stackalloc uint[count]
+                : (rented = ArrayPool<uint>.Shared.Rent(count)).AsSpan(0, count);
+            try
             {
-                keys[k++] = kvp.Key;
-            }
+                int k = 0;
+                foreach (var kvp in _floatConstants)
+                {
+                    keys[k++] = kvp.Key;
+                }
 
-            for (int i = 0; i < k; i++)
+                for (int i = 0; i < k; i++)
+                {
+                    GetOrEmitFloatConstant(floatTypeId, keys[i]);
+                }
+            }
+            finally
             {
-                GetOrEmitFloatConstant(floatTypeId, keys[i]);
+                if (rented is not null)
+                {
+                    ArrayPool<uint>.Shared.Return(rented);
+                }
             }
         }
 
         if (_uintConstants.Count > 1 || usesBarrier)
         {
-            Span<uint> keys = stackalloc uint[_uintConstants.Count];
-            int k = 0;
-            foreach (var kvp in _uintConstants)
+            int count = _uintConstants.Count;
+            uint[]? rented = null;
+            Span<uint> keys = count <= 128
+                ? stackalloc uint[count]
+                : (rented = ArrayPool<uint>.Shared.Rent(count)).AsSpan(0, count);
+            try
             {
-                keys[k++] = kvp.Key;
-            }
+                int k = 0;
+                foreach (var kvp in _uintConstants)
+                {
+                    keys[k++] = kvp.Key;
+                }
 
-            for (int i = 0; i < k; i++)
+                for (int i = 0; i < k; i++)
+                {
+                    GetOrEmitUintConstant(uintTypeId, keys[i]);
+                }
+            }
+            finally
             {
-                GetOrEmitUintConstant(uintTypeId, keys[i]);
+                if (rented is not null)
+                {
+                    ArrayPool<uint>.Shared.Return(rented);
+                }
             }
         }
 
@@ -545,55 +528,51 @@ public sealed class SpirvBinaryEmitter
             EmitInstruction(SpirvOpcode.OpTypePointer, ptrFuncUintId, SpirvOpcode.StorageClassFunction, uintTypeId);
         }
 
-        uint ptrInputUintId = 0;
-        uint ptrStorageFloatId = 0;
+        uint v3UintTypeId = NextId();
+        uint ptrInputV3UintId = NextId();
+        uint ptrInputUintId = NextId();
+
+        EmitInstruction(SpirvOpcode.OpTypeVector, v3UintTypeId, uintTypeId, 3);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrInputV3UintId, SpirvOpcode.StorageClassInput, v3UintTypeId);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrInputUintId, SpirvOpcode.StorageClassInput, uintTypeId);
+
+        EmitInstruction(SpirvOpcode.OpVariable, ptrInputV3UintId, globalInvIdVar, SpirvOpcode.StorageClassInput);
+        EmitInstruction(SpirvOpcode.OpVariable, ptrInputV3UintId, localInvIdVar, SpirvOpcode.StorageClassInput);
+
+        // StorageBuffer types & variables (set=0, binding=0..2)
+        uint ptrStorageStructId = NextId();
+        uint ptrStorageFloatId = NextId();
+
+        EmitInstruction(SpirvOpcode.OpTypeRuntimeArray, runtimeArrayFloatTypeId, floatTypeId);
+        EmitInstruction(SpirvOpcode.OpTypeStruct, storageStructTypeId, runtimeArrayFloatTypeId);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrStorageStructId, SpirvOpcode.StorageClassStorageBuffer, storageStructTypeId);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrStorageFloatId, SpirvOpcode.StorageClassStorageBuffer, floatTypeId);
+
+        EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[0], SpirvOpcode.StorageClassStorageBuffer);
+        EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[1], SpirvOpcode.StorageClassStorageBuffer);
+        EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[2], SpirvOpcode.StorageClassStorageBuffer);
+
+        // PushConstant block & variable (param_n element count)
+        uint ptrPushConstStructId = NextId();
+        uint ptrPushConstUintId = NextId();
+        EmitInstruction(SpirvOpcode.OpTypeStruct, pushConstStructTypeId, uintTypeId);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrPushConstStructId, SpirvOpcode.StorageClassPushConstant, pushConstStructTypeId);
+        EmitInstruction(SpirvOpcode.OpTypePointer, ptrPushConstUintId, SpirvOpcode.StorageClassPushConstant, uintTypeId);
+        EmitInstruction(SpirvOpcode.OpVariable, ptrPushConstStructId, pushConstVar, SpirvOpcode.StorageClassPushConstant);
+
+        // Optional Workgroup shared memory (float[1024] = 4096 bytes)
         uint ptrWorkgroupFloatId = 0;
-
-        if (isCompute)
+        if (usesShared)
         {
-            uint v3UintTypeId = NextId();
-            uint ptrInputV3UintId = NextId();
-            ptrInputUintId = NextId();
+            uint const1024Id = _uintConstants[1024u];
+            uint sharedArrayTypeId = NextId();
+            uint ptrWorkgroupArrayId = NextId();
+            ptrWorkgroupFloatId = NextId();
 
-            EmitInstruction(SpirvOpcode.OpTypeVector, v3UintTypeId, uintTypeId, 3);
-            EmitInstruction(SpirvOpcode.OpTypePointer, ptrInputV3UintId, SpirvOpcode.StorageClassInput, v3UintTypeId);
-            EmitInstruction(SpirvOpcode.OpTypePointer, ptrInputUintId, SpirvOpcode.StorageClassInput, uintTypeId);
-
-            EmitInstruction(SpirvOpcode.OpVariable, ptrInputV3UintId, globalInvIdVar, SpirvOpcode.StorageClassInput);
-            EmitInstruction(SpirvOpcode.OpVariable, ptrInputV3UintId, localInvIdVar, SpirvOpcode.StorageClassInput);
-
-            // StorageBuffer types & variables (set=0, binding=0..2)
-            uint ptrStorageStructId = NextId();
-            ptrStorageFloatId = NextId();
-
-            EmitInstruction(SpirvOpcode.OpTypeRuntimeArray, runtimeArrayFloatTypeId, floatTypeId);
-            EmitInstruction(SpirvOpcode.OpTypeStruct, storageStructTypeId, runtimeArrayFloatTypeId);
-            EmitInstruction(SpirvOpcode.OpTypePointer, ptrStorageStructId, SpirvOpcode.StorageClassStorageBuffer, storageStructTypeId);
-            EmitInstruction(SpirvOpcode.OpTypePointer, ptrStorageFloatId, SpirvOpcode.StorageClassStorageBuffer, floatTypeId);
-
-            EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[0], SpirvOpcode.StorageClassStorageBuffer);
-            EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[1], SpirvOpcode.StorageClassStorageBuffer);
-            EmitInstruction(SpirvOpcode.OpVariable, ptrStorageStructId, storageBufferVars[2], SpirvOpcode.StorageClassStorageBuffer);
-
-            // PushConstant block & variable (param_n element count)
-            uint ptrPushConstStructId = NextId();
-            EmitInstruction(SpirvOpcode.OpTypeStruct, pushConstStructTypeId, uintTypeId);
-            EmitInstruction(SpirvOpcode.OpTypePointer, ptrPushConstStructId, SpirvOpcode.StorageClassPushConstant, pushConstStructTypeId);
-            EmitInstruction(SpirvOpcode.OpVariable, ptrPushConstStructId, pushConstVar, SpirvOpcode.StorageClassPushConstant);
-
-            // Optional Workgroup shared memory (float[1024] = 4096 bytes)
-            if (usesShared)
-            {
-                uint const1024Id = _uintConstants[1024u];
-                uint sharedArrayTypeId = NextId();
-                uint ptrWorkgroupArrayId = NextId();
-                ptrWorkgroupFloatId = NextId();
-
-                EmitInstruction(SpirvOpcode.OpTypeArray, sharedArrayTypeId, floatTypeId, const1024Id);
-                EmitInstruction(SpirvOpcode.OpTypePointer, ptrWorkgroupArrayId, SpirvOpcode.StorageClassWorkgroup, sharedArrayTypeId);
-                EmitInstruction(SpirvOpcode.OpTypePointer, ptrWorkgroupFloatId, SpirvOpcode.StorageClassWorkgroup, floatTypeId);
-                EmitInstruction(SpirvOpcode.OpVariable, ptrWorkgroupArrayId, sharedMemVar, SpirvOpcode.StorageClassWorkgroup);
-            }
+            EmitInstruction(SpirvOpcode.OpTypeArray, sharedArrayTypeId, floatTypeId, const1024Id);
+            EmitInstruction(SpirvOpcode.OpTypePointer, ptrWorkgroupArrayId, SpirvOpcode.StorageClassWorkgroup, sharedArrayTypeId);
+            EmitInstruction(SpirvOpcode.OpTypePointer, ptrWorkgroupFloatId, SpirvOpcode.StorageClassWorkgroup, floatTypeId);
+            EmitInstruction(SpirvOpcode.OpVariable, ptrWorkgroupArrayId, sharedMemVar, SpirvOpcode.StorageClassWorkgroup);
         }
 
         // -------------------------------------------------------------------
@@ -618,6 +597,12 @@ public sealed class SpirvBinaryEmitter
                 EmitInstruction(SpirvOpcode.OpVariable, ptrFuncUintId, _idxVars[r], SpirvOpcode.StorageClassFunction, constUintZeroId);
             }
         }
+
+        // Load PushConstant param_n once after function OpVariables for structured bounds guarding
+        uint paramNPtr = NextId();
+        uint paramNVal = NextId();
+        EmitInstruction(SpirvOpcode.OpAccessChain, ptrPushConstUintId, paramNPtr, pushConstVar, constUintZeroId);
+        EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, paramNVal, paramNPtr);
 
         // -------------------------------------------------------------------
         // 11. Instruction Translation (single-termination guarded)
@@ -713,12 +698,29 @@ public sealed class SpirvBinaryEmitter
                     {
                         int bufIdx = Math.Clamp(inst.OperandA, 0, 2);
                         uint idxVal = NextId();
+                        uint isOob = NextId();
+                        uint inBoundsLabel = NextId();
+                        uint oobLabel = NextId();
+                        uint mergeLabel = NextId();
                         uint elemPtr = NextId();
                         uint loaded = NextId();
+
                         EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, idxVal, _idxVars[b]);
+                        EmitInstruction(SpirvOpcode.OpUGreaterThanEqual, boolTypeId, isOob, idxVal, paramNVal);
+                        EmitInstruction(SpirvOpcode.OpSelectionMerge, mergeLabel, SpirvOpcode.SelectionControlNone);
+                        EmitInstruction(SpirvOpcode.OpBranchConditional, isOob, oobLabel, inBoundsLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, inBoundsLabel);
                         EmitInstruction(SpirvOpcode.OpAccessChain, ptrStorageFloatId, elemPtr, storageBufferVars[bufIdx], constUintZeroId, idxVal);
                         EmitInstruction(SpirvOpcode.OpLoad, floatTypeId, loaded, elemPtr);
                         EmitInstruction(SpirvOpcode.OpStore, _regVars[d], loaded);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, oobLabel);
+                        EmitInstruction(SpirvOpcode.OpStore, _regVars[d], constFloatZeroId);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, mergeLabel);
                         break;
                     }
 
@@ -726,23 +728,52 @@ public sealed class SpirvBinaryEmitter
                     {
                         uint valA = NextId();
                         uint idxVal = NextId();
+                        uint isOob = NextId();
+                        uint inBoundsLabel = NextId();
+                        uint mergeLabel = NextId();
                         uint elemPtr = NextId();
+
                         EmitInstruction(SpirvOpcode.OpLoad, floatTypeId, valA, _regVars[a]);
                         EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, idxVal, _idxVars[b]);
+                        EmitInstruction(SpirvOpcode.OpUGreaterThanEqual, boolTypeId, isOob, idxVal, paramNVal);
+                        EmitInstruction(SpirvOpcode.OpSelectionMerge, mergeLabel, SpirvOpcode.SelectionControlNone);
+                        EmitInstruction(SpirvOpcode.OpBranchConditional, isOob, mergeLabel, inBoundsLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, inBoundsLabel);
                         EmitInstruction(SpirvOpcode.OpAccessChain, ptrStorageFloatId, elemPtr, storageBufferVars[2], constUintZeroId, idxVal);
                         EmitInstruction(SpirvOpcode.OpStore, elemPtr, valA);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, mergeLabel);
                         break;
                     }
 
                 case ComputeOpcode.LoadShared:
                     {
                         uint idxVal = NextId();
+                        uint isOob = NextId();
+                        uint inBoundsLabel = NextId();
+                        uint oobLabel = NextId();
+                        uint mergeLabel = NextId();
                         uint elemPtr = NextId();
                         uint loaded = NextId();
+
                         EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, idxVal, _idxVars[b]);
+                        EmitInstruction(SpirvOpcode.OpUGreaterThanEqual, boolTypeId, isOob, idxVal, _uintConstants[1024u]);
+                        EmitInstruction(SpirvOpcode.OpSelectionMerge, mergeLabel, SpirvOpcode.SelectionControlNone);
+                        EmitInstruction(SpirvOpcode.OpBranchConditional, isOob, oobLabel, inBoundsLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, inBoundsLabel);
                         EmitInstruction(SpirvOpcode.OpAccessChain, ptrWorkgroupFloatId, elemPtr, sharedMemVar, idxVal);
                         EmitInstruction(SpirvOpcode.OpLoad, floatTypeId, loaded, elemPtr);
                         EmitInstruction(SpirvOpcode.OpStore, _regVars[d], loaded);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, oobLabel);
+                        EmitInstruction(SpirvOpcode.OpStore, _regVars[d], constFloatZeroId);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, mergeLabel);
                         break;
                     }
 
@@ -750,11 +781,23 @@ public sealed class SpirvBinaryEmitter
                     {
                         uint valA = NextId();
                         uint idxVal = NextId();
+                        uint isOob = NextId();
+                        uint inBoundsLabel = NextId();
+                        uint mergeLabel = NextId();
                         uint elemPtr = NextId();
+
                         EmitInstruction(SpirvOpcode.OpLoad, floatTypeId, valA, _regVars[a]);
                         EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, idxVal, _idxVars[b]);
+                        EmitInstruction(SpirvOpcode.OpUGreaterThanEqual, boolTypeId, isOob, idxVal, _uintConstants[1024u]);
+                        EmitInstruction(SpirvOpcode.OpSelectionMerge, mergeLabel, SpirvOpcode.SelectionControlNone);
+                        EmitInstruction(SpirvOpcode.OpBranchConditional, isOob, mergeLabel, inBoundsLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, inBoundsLabel);
                         EmitInstruction(SpirvOpcode.OpAccessChain, ptrWorkgroupFloatId, elemPtr, sharedMemVar, idxVal);
                         EmitInstruction(SpirvOpcode.OpStore, elemPtr, valA);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, mergeLabel);
                         break;
                     }
 
@@ -821,10 +864,20 @@ public sealed class SpirvBinaryEmitter
                     {
                         uint valA = NextId();
                         uint idxVal = NextId();
+                        uint isOob = NextId();
+                        uint inBoundsLabel = NextId();
+                        uint oobLabel = NextId();
+                        uint mergeLabel = NextId();
                         uint elemPtr = NextId();
                         uint oldVal = NextId();
+
                         EmitInstruction(SpirvOpcode.OpLoad, floatTypeId, valA, _regVars[a]);
                         EmitInstruction(SpirvOpcode.OpLoad, uintTypeId, idxVal, _idxVars[b]);
+                        EmitInstruction(SpirvOpcode.OpUGreaterThanEqual, boolTypeId, isOob, idxVal, paramNVal);
+                        EmitInstruction(SpirvOpcode.OpSelectionMerge, mergeLabel, SpirvOpcode.SelectionControlNone);
+                        EmitInstruction(SpirvOpcode.OpBranchConditional, isOob, oobLabel, inBoundsLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, inBoundsLabel);
                         EmitInstruction(SpirvOpcode.OpAccessChain, ptrStorageFloatId, elemPtr, storageBufferVars[2], constUintZeroId, idxVal);
                         EmitInstruction(
                             SpirvOpcode.OpAtomicFAddEXT,
@@ -835,6 +888,13 @@ public sealed class SpirvBinaryEmitter
                             _uintConstants[SpirvOpcode.MemorySemanticsRelaxed],
                             valA);
                         EmitInstruction(SpirvOpcode.OpStore, _regVars[d], oldVal);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, oobLabel);
+                        EmitInstruction(SpirvOpcode.OpStore, _regVars[d], constFloatZeroId);
+                        EmitInstruction(SpirvOpcode.OpBranch, mergeLabel);
+
+                        EmitInstruction(SpirvOpcode.OpLabel, mergeLabel);
                         break;
                     }
 

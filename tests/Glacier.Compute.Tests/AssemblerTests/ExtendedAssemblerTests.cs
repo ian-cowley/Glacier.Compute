@@ -6,7 +6,6 @@
 namespace Glacier.Compute.Tests.AssemblerTests;
 
 using System;
-using System.Runtime.InteropServices;
 using Glacier.Compute;
 using Glacier.Compute.Assembler;
 using Glacier.Compute.Assembler.Dxbc;
@@ -41,7 +40,7 @@ public class ExtendedAssemblerTests
     }
 
     [Fact]
-    public void SpirvBinaryEmitter_VertexAndPixelStages_OmitComputeOnlyBuiltInsAndLocalSize()
+    public void SpirvBinaryEmitter_NonComputeStages_ThrowNotSupportedException()
     {
         var emitter = new SpirvBinaryEmitter();
         var instructions = new Instruction[]
@@ -50,42 +49,9 @@ public class ExtendedAssemblerTests
             new((int)ComputeOpcode.Return, 0, 0, 0)
         };
 
-        var vertBytes = emitter.EmitModule(ShaderStage.Vertex, instructions);
-        Assert.True(SpirvValidator.Validate(vertBytes.Span, out string? vertErr), vertErr);
-        AssertDoesNotContainComputeBuiltInOrLocalSize(vertBytes.Span);
-
-        var pixelBytes = emitter.EmitModule(ShaderStage.Pixel, instructions);
-        Assert.True(SpirvValidator.Validate(pixelBytes.Span, out string? pixErr), pixErr);
-        AssertDoesNotContainComputeBuiltInOrLocalSize(pixelBytes.Span);
-
-        // Compute-only opcodes on Vertex/Pixel must throw NotSupportedException
-        var computeOnly = new Instruction[] { new((int)ComputeOpcode.GlobalId, 0, 0, 1) };
-        Assert.Throws<NotSupportedException>(() => emitter.EmitModule(ShaderStage.Vertex, computeOnly));
-        Assert.Throws<NotSupportedException>(() => emitter.EmitModule(ShaderStage.Pixel, computeOnly));
-    }
-
-    private static void AssertDoesNotContainComputeBuiltInOrLocalSize(ReadOnlySpan<byte> spirvBytes)
-    {
-        ReadOnlySpan<uint> words = MemoryMarshal.Cast<byte, uint>(spirvBytes);
-        int idx = 5;
-        while (idx < words.Length)
-        {
-            ushort opcode = (ushort)(words[idx] & 0xFFFF);
-            ushort count = (ushort)(words[idx] >> 16);
-            if (opcode == SpirvOpcode.OpDecorate && count >= 4 &&
-                words[idx + 2] == SpirvOpcode.DecorationBuiltIn)
-            {
-                Assert.NotEqual(SpirvOpcode.BuiltInGlobalInvocationId, words[idx + 3]);
-                Assert.NotEqual(SpirvOpcode.BuiltInLocalInvocationId, words[idx + 3]);
-            }
-
-            if (opcode == SpirvOpcode.OpExecutionMode && count >= 3)
-            {
-                Assert.NotEqual(SpirvOpcode.ExecutionModeLocalSize, words[idx + 2]);
-            }
-
-            idx += count;
-        }
+        Assert.Throws<NotSupportedException>(() => emitter.EmitModule(ShaderStage.Vertex, instructions));
+        Assert.Throws<NotSupportedException>(() => emitter.EmitModule(ShaderStage.Pixel, instructions));
+        Assert.Throws<NotSupportedException>(() => emitter.EmitModule((ShaderStage)99, instructions));
     }
 
     [Fact]

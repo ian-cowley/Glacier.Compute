@@ -66,9 +66,11 @@ public static class SpirvOpcode
     public const ushort OpSDiv = 135;
     public const ushort OpFDiv = 136;
     public const ushort OpDot = 148;
+    public const ushort OpUGreaterThanEqual = 173;
     public const ushort OpControlBarrier = 224;
     public const ushort OpMemoryBarrier = 225;
     public const ushort OpAtomicIAdd = 227;
+    public const ushort OpSelectionMerge = 247;
     public const ushort OpLabel = 248;
     public const ushort OpBranch = 249;
     public const ushort OpBranchConditional = 250;
@@ -131,6 +133,7 @@ public static class SpirvOpcode
     public const uint ScopeSubgroup = 3;
     public const uint MemorySemanticsRelaxed = 0x0;
     public const uint MemorySemanticsWorkgroupAcquireRelease = 0x108;
+    public const uint SelectionControlNone = 0;
 
     // GLSL.std.450 Extended Instruction Opcodes
     public const uint GlslStd450FAbs = 4;

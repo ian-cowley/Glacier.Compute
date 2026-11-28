@@ -102,4 +102,49 @@ public class DeviceMemoryPoolTests
         Assert.Equal(1, releaseCalls);
         Assert.Equal(syntheticDeviceVramBase, releasedPtr);
     }
+
+    [Fact]
+    public void DeviceMemoryPool_ScratchWorkspaceDispose_ReleasesRingLeaseForWraparound()
+    {
+        using var pool = new DeviceMemoryPool(
+            buddyArenaBytes: 1024 * 1024,
+            virtualReserveBytes: 4 * 1024 * 1024,
+            scratchBytes: 8192);
+
+        // Rent and dispose 16 x 4 KB slices (64 KB >> 8 KB capacity) — must succeed via ScratchWorkspace.Dispose -> Free
+        for (int i = 0; i < 16; i++)
+        {
+            using var ws = pool.RentScratchWorkspace(4096);
+            Assert.True(pool.ScratchTier.Contains(ws.Pointer));
+        }
+
+        // Un-disposed full-capacity lease must block subsequent wraparound until disposed
+        using (var held = pool.RentScratchWorkspace(8192))
+        {
+            Assert.Throws<OutOfMemoryException>(() => pool.RentScratchWorkspace(4096));
+        }
+
+        using var afterDispose = pool.RentScratchWorkspace(8192);
+        Assert.Equal(pool.ScratchTier.BaseAddress, afterDispose.Pointer);
+    }
+
+    [Fact]
+    public void DeviceMemoryPool_RentScratchWorkspace_FullCapacityAfterPartialDrain_Succeeds()
+    {
+        // Challenger Repro 3.2: 128 KB scratch ring -> rent 64 KB + dispose -> rent 128 KB must succeed
+        const ulong scratchCapacity = 128 * 1024;
+        using var pool = new DeviceMemoryPool(
+            buddyArenaBytes: 1024 * 1024,
+            virtualReserveBytes: 4 * 1024 * 1024,
+            scratchBytes: scratchCapacity);
+
+        using (var first = pool.RentScratchWorkspace(64 * 1024))
+        {
+            Assert.Equal(pool.ScratchTier.BaseAddress, first.Pointer);
+        }
+
+        using var full = pool.RentScratchWorkspace(scratchCapacity);
+        Assert.Equal(pool.ScratchTier.BaseAddress, full.Pointer);
+        Assert.Equal(scratchCapacity, full.Capacity);
+    }
 }

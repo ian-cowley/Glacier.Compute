@@ -123,7 +123,8 @@ public static class Program
             slab.Free(p1);
             var p2 = buddy.Allocate(256 * 1024);
             buddy.Free(p2);
-            _ = ring.Allocate(4096);
+            var p3 = ring.Allocate(4096);
+            ring.Free(p3);
         }
 
         const int allocIters = 50_000;
@@ -150,7 +151,8 @@ public static class Program
         sw.Restart();
         for (int i = 0; i < allocIters; i++)
         {
-            _ = ring.Allocate(4096);
+            var p = ring.Allocate(4096);
+            ring.Free(p);
         }
         sw.Stop();
         double ringNs = sw.Elapsed.TotalNanoseconds / allocIters;

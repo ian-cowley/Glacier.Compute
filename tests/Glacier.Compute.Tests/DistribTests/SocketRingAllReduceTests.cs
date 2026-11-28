@@ -6,6 +6,8 @@
 namespace Glacier.Compute.Tests.DistribTests;
 
 using System;
+using System.Buffers.Binary;
+using System.IO;
 using System.Net;
 using System.Net.Sockets;
 using System.Threading;
@@ -94,5 +96,61 @@ public class SocketRingAllReduceTests
                 predSockets[r]?.Dispose();
             }
         }
+    }
+
+    [Fact]
+    public void RingSocketTransport_ValidatesConstructorArguments()
+    {
+        using var s1 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        using var s2 = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketTransport(0, 0, s1, s2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketTransport(-1, 2, s1, s2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketTransport(2, 2, s1, s2));
+        Assert.Throws<ArgumentOutOfRangeException>(() => new RingSocketTransport(0, 2, s1, s2, maxFrameBytes: 3));
+    }
+
+    [Fact]
+    public async Task RingSocketTransport_RejectsOversizedSend_AndAdversarialReceiveHeaders_WithoutAllocation()
+    {
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        int port = ((IPEndPoint)listener.LocalEndpoint).Port;
+
+        using var senderSocket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+        var acceptTask = listener.AcceptSocketAsync(cts.Token).AsTask();
+        await senderSocket.ConnectAsync(IPAddress.Loopback, port, cts.Token);
+        using var receiverSocket = await acceptTask.WaitAsync(cts.Token);
+        listener.Stop();
+
+        const int maxFrameBytes = 64; // max 16 floats
+        using var transport = new RingSocketTransport(0, 2, senderSocket, receiverSocket, maxFrameBytes);
+
+        // Send exceeding MaxFrameBytes must fail before sending
+        float[] tooBig = new float[17]; // 68 bytes > 64
+        await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+            await transport.SendToSuccessorAsync(tooBig, cts.Token));
+
+        // Adversarial length headers sent raw from peer to receiver
+        float[] recvBuffer = new float[16];
+        int[] badLengths = { -1, 5, maxFrameBytes + 4, int.MaxValue };
+        byte[] header = new byte[4];
+
+        foreach (int badLen in badLengths)
+        {
+            BinaryPrimitives.WriteInt32LittleEndian(header, badLen);
+            await senderSocket.SendAsync(header, SocketFlags.None, cts.Token);
+
+            await Assert.ThrowsAsync<InvalidDataException>(async () =>
+                await transport.ReceiveFromPredecessorAsync(recvBuffer, cts.Token));
+        }
+
+        // Verify valid chunked send/receive still works after configuring sockets
+        float[] valid = { 1.5f, -2.25f, 3.75f, 4.0f };
+        await transport.SendToSuccessorAsync(valid, cts.Token);
+        float[] received = new float[4];
+        await transport.ReceiveFromPredecessorAsync(received, cts.Token);
+        Assert.Equal(valid, received);
     }
 }

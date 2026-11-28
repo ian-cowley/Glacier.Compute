@@ -154,11 +154,19 @@ public class SpirvEmitterTests
         Assert.Contains(SpirvOpcode.GlslStd450Log, seenGlslOps);
         Assert.Contains(SpirvOpcode.GlslStd450Tanh, seenGlslOps);
 
-        // Verify memory & atomic & subgroup ops
+        // Verify memory & atomic & subgroup ops + structured bounds guards
         Assert.Contains(SpirvOpcode.OpAccessChain, seenOpcodes);
+        Assert.Contains(SpirvOpcode.OpTypeBool, seenOpcodes);
+        Assert.Contains(SpirvOpcode.OpUGreaterThanEqual, seenOpcodes);
+        Assert.Contains(SpirvOpcode.OpSelectionMerge, seenOpcodes);
+        Assert.Contains(SpirvOpcode.OpBranchConditional, seenOpcodes);
         Assert.Contains(SpirvOpcode.OpAtomicFAddEXT, seenOpcodes);
         Assert.Contains(SpirvOpcode.OpGroupNonUniformShuffleXor, seenOpcodes);
         Assert.Contains(SpirvOpcode.OpControlBarrier, seenOpcodes);
+
+        // 5 memory/atomic ops (LoadGlobal x2, StoreShared, LoadShared, StoreGlobal, AtomicAdd = 6 ops) -> >= 6 bounds comparisons
+        Assert.True(CountOpcode(spirv.Span, SpirvOpcode.OpUGreaterThanEqual) >= 6);
+        Assert.True(CountOpcode(spirv.Span, SpirvOpcode.OpSelectionMerge) >= 6);
     }
 
     [Fact]
@@ -274,6 +282,76 @@ public class SpirvEmitterTests
         BinaryPrimitives.WriteUInt32LittleEndian(outOfBoundsId.AsSpan(12, 4), 2u);
         Assert.False(SpirvValidator.Validate(outOfBoundsId, out string? boundErr));
         Assert.Contains("Invalid SPIR-V ID", boundErr);
+    }
+
+    [Fact]
+    public void SpirvValidator_RejectsCorruptedSelectionMergeAndUGreaterThanEqualIds()
+    {
+        var emitter = new SpirvBinaryEmitter();
+        byte[] module = emitter.EmitModule(ShaderStage.Compute, new Instruction[]
+        {
+            new((int)ComputeOpcode.GlobalId, 0, 0, 0),
+            new((int)ComputeOpcode.LoadGlobal, 0, 0, 1),
+            new((int)ComputeOpcode.Return, 0, 0, 0)
+        }).ToArray();
+
+        Assert.True(SpirvValidator.Validate(module, out string? validErr), validErr);
+
+        uint bound = BinaryPrimitives.ReadUInt32LittleEndian(module.AsSpan(12, 4));
+
+        // Corrupt OpUGreaterThanEqual operand 1 to >= bound
+        byte[] badUge = (byte[])module.Clone();
+        int ugeWord = FindOpcodeWordIndex(badUge, SpirvOpcode.OpUGreaterThanEqual);
+        Assert.True(ugeWord >= 5);
+        BinaryPrimitives.WriteUInt32LittleEndian(badUge.AsSpan((ugeWord + 3) * 4, 4), bound + 5);
+        Assert.False(SpirvValidator.Validate(badUge, out string? ugeErr));
+        Assert.Contains("Invalid SPIR-V ID", ugeErr);
+
+        // Corrupt OpSelectionMerge merge-block ID to 0
+        byte[] badMerge = (byte[])module.Clone();
+        int mergeWord = FindOpcodeWordIndex(badMerge, SpirvOpcode.OpSelectionMerge);
+        Assert.True(mergeWord >= 5);
+        BinaryPrimitives.WriteUInt32LittleEndian(badMerge.AsSpan((mergeWord + 1) * 4, 4), 0u);
+        Assert.False(SpirvValidator.Validate(badMerge, out string? mergeErr));
+        Assert.Contains("Invalid SPIR-V ID", mergeErr);
+    }
+
+    [Fact]
+    public void SpirvBinaryEmitter_HandlesManyDistinctConstants_ViaArrayPoolFallback()
+    {
+        var emitter = new SpirvBinaryEmitter();
+        const int constantCount = 160; // > 128 stackalloc threshold
+        var instructions = new Instruction[constantCount + 1];
+        for (int c = 0; c < constantCount; c++)
+        {
+            int bits = BitConverter.SingleToInt32Bits(c + 1.25f);
+            instructions[c] = new Instruction((int)ComputeOpcode.LoadConstant, bits, 0, c % 64);
+        }
+
+        instructions[constantCount] = new Instruction((int)ComputeOpcode.Return, 0, 0, 0);
+
+        var spirv = emitter.EmitModule(ShaderStage.Compute, instructions);
+        Assert.True(SpirvValidator.Validate(spirv.Span, out string? err), err);
+        Assert.True(CountOpcode(spirv.Span, SpirvOpcode.OpConstant) >= constantCount);
+    }
+
+    private static int FindOpcodeWordIndex(ReadOnlySpan<byte> spirvBytes, ushort targetOpcode)
+    {
+        ReadOnlySpan<uint> words = MemoryMarshal.Cast<byte, uint>(spirvBytes);
+        int i = 5;
+        while (i < words.Length)
+        {
+            ushort op = (ushort)(words[i] & 0xFFFF);
+            ushort wc = (ushort)(words[i] >> 16);
+            if (op == targetOpcode)
+            {
+                return i;
+            }
+
+            i += wc;
+        }
+
+        return -1;
     }
 
     private static int CountOpcode(ReadOnlySpan<byte> spirvBytes, ushort targetOpcode)

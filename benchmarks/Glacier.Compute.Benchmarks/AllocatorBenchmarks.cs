@@ -60,7 +60,9 @@ public class AllocatorBenchmarks
     [Benchmark]
     public DevicePointer ScratchWorkspacePointerBump()
     {
-        return _scratchWorkspace.Allocate(4096);
+        var ptr = _scratchWorkspace.Allocate(4096);
+        _scratchWorkspace.Free(ptr);
+        return ptr;
     }
 
     [Benchmark]

@@ -35,14 +35,17 @@ public sealed class SlabAllocator : IDisposable
     /// <param name="slotsPerBin">Number of fixed-size slots per bin (must be a positive multiple of 64; defaults to 1024).</param>
     public SlabAllocator(int slotsPerBin = 1024)
     {
-        if (slotsPerBin > (int.MaxValue / 65536))
+        if (slotsPerBin <= 0 || slotsPerBin > (int.MaxValue / 65536))
         {
-            throw new ArgumentOutOfRangeException(nameof(slotsPerBin), "Slots per bin exceeds allowable memory capacity.");
+            throw new ArgumentOutOfRangeException(
+                nameof(slotsPerBin),
+                slotsPerBin,
+                "Slots per bin must be a positive multiple of 64 within allowable memory capacity.");
         }
 
-        if (slotsPerBin <= 0 || (slotsPerBin % 64) != 0)
+        if ((slotsPerBin % 64) != 0)
         {
-            slotsPerBin = 1024;
+            throw new ArgumentException("Slots per bin must be a positive multiple of 64.", nameof(slotsPerBin));
         }
 
         _bins = new SlabBin[BinSizes.Length];

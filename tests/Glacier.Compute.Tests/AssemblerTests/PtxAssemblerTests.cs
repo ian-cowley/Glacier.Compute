@@ -6,9 +6,11 @@
 namespace Glacier.Compute.Tests.AssemblerTests;
 
 using System;
+using System.Text.RegularExpressions;
 using Glacier.Compute;
 using Glacier.Compute.Assembler;
 using Glacier.Compute.Assembler.Ptx;
+using Glacier.Compute.Drivers;
 using Xunit;
 
 public class PtxAssemblerTests
@@ -33,7 +35,7 @@ public class PtxAssemblerTests
     }
 
     [Fact]
-    public void PtxEmitter_TranslatesArithmeticOpcodes()
+    public void PtxEmitter_TranslatesArithmeticOpcodes_WithExactRegisterCounts()
     {
         var instructions = new Instruction[]
         {
@@ -55,53 +57,96 @@ public class PtxAssemblerTests
 
         string ptx = PtxEmitter.Emit(instructions);
 
-        Assert.Contains("add.f32 %f3, %f1, %f2;", ptx);
-        Assert.Contains("sub.f32 %f6, %f4, %f5;", ptx);
-        Assert.Contains("mul.f32 %f9, %f7, %f8;", ptx);
-        Assert.Contains("div.rn.f32 %f12, %f10, %f11;", ptx);
-        Assert.Contains("fma.rn.f32 %f15, %f13, %f14, %f15;", ptx);
-        Assert.Contains("neg.f32 %f17, %f16;", ptx);
-        Assert.Contains("abs.f32 %f19, %f18;", ptx);
-        Assert.Contains("min.f32 %f22, %f20, %f21;", ptx);
-        Assert.Contains("max.f32 %f25, %f23, %f24;", ptx);
-        Assert.Contains("sqrt.rn.f32 %f27, %f26;", ptx);
-        Assert.Contains("rsqrt.approx.f32 %f29, %f28;", ptx);
-        Assert.Contains("mul.f32 %f31, %f30, 0f3FB8AA3B;", ptx);
-        Assert.Contains("ex2.approx.f32 %f31, %f31;", ptx);
-        Assert.Contains("lg2.approx.f32 %f33, %f32;", ptx);
-        Assert.Contains("mul.f32 %f33, %f33, 0f3F317218;", ptx);
-        Assert.Contains("tanh.approx.f32 %f35, %f34;", ptx);
+        Assert.Contains("add.f32 %f", ptx);
+        Assert.Contains("sub.f32 %f", ptx);
+        Assert.Contains("mul.f32 %f", ptx);
+        Assert.Contains("div.rn.f32 %f", ptx);
+        Assert.Contains("fma.rn.f32 %f", ptx);
+        Assert.Contains("neg.f32 %f", ptx);
+        Assert.Contains("abs.f32 %f", ptx);
+        Assert.Contains("min.f32 %f", ptx);
+        Assert.Contains("max.f32 %f", ptx);
+        Assert.Contains("sqrt.rn.f32 %f", ptx);
+        Assert.Contains("rsqrt.approx.f32 %f", ptx);
+        Assert.Contains(", 0f3FB8AA3B;", ptx);
+        Assert.Contains("ex2.approx.f32 %f", ptx);
+        Assert.Contains("lg2.approx.f32 %f", ptx);
+        Assert.Contains(", 0f3F317218;", ptx);
+        Assert.Contains("tanh.approx.f32 %f", ptx);
+
+        // Exact register declarations: 1 pred (%p0), 5 ABI %r, 3 ABI %rd, 35 live %f (vregs 1..35), no unused smem
+        Assert.Contains(".reg .pred %p<1>;", ptx);
+        Assert.Contains(".reg .b32  %r<5>;", ptx);
+        Assert.Contains(".reg .b64  %rd<3>;", ptx);
+        Assert.Contains(".reg .f32  %f<35>;", ptx);
+        Assert.DoesNotContain("smem_workspace", ptx);
     }
 
     [Fact]
-    public void PtxEmitter_TranslatesSyncAndMemoryOpcodes()
+    public void PtxEmitter_TypedRegisterAllocation_PreventsAbiCollisionAndClobber()
     {
         var instructions = new Instruction[]
         {
-            new((int)ComputeOpcode.ShflSyncBfly, 1, 16, 2),
+            new((int)ComputeOpcode.ShflSyncBfly, 60, 16, 61),
             new((int)ComputeOpcode.BarrierSync, 0, 0, 0),
-            new((int)ComputeOpcode.LocalId, 0, 0, 5),
-            new((int)ComputeOpcode.GlobalId, 0, 0, 6),
-            new((int)ComputeOpcode.LoadShared, 0, 7, 8),
-            new((int)ComputeOpcode.StoreShared, 9, 10, 0),
-            new((int)ComputeOpcode.AtomicAdd, 11, 12, 13),
-            new((int)ComputeOpcode.LoadGlobal, 1, 5, 14),
-            new((int)ComputeOpcode.LoadConstant, BitConverter.SingleToInt32Bits(2.5f), 0, 15)
+            new((int)ComputeOpcode.LocalId, 0, 0, 1),   // virtual r1 must NOT clobber ABI param_n (%r0) or gid (%r4)
+            new((int)ComputeOpcode.GlobalId, 0, 0, 4),  // virtual r4 must NOT clobber ABI gid (%r4)
+            new((int)ComputeOpcode.LoadShared, 0, 4, 8),
+            new((int)ComputeOpcode.StoreShared, 8, 1, 0),
+            new((int)ComputeOpcode.AtomicAdd, 8, 4, 13),
+            new((int)ComputeOpcode.LoadGlobal, 99, 4, 14), // out-of-range buffer index clamps to param_output (%rd2)
+            new((int)ComputeOpcode.LoadConstant, BitConverter.SingleToInt32Bits(2.5f), 0, 15),
+            new((int)ComputeOpcode.Add, 1, 15, 16), // uses LocalId vreg 1 as float -> cvt.rn.f32.u32 required
+            new((int)ComputeOpcode.StoreGlobal, 16, 15, 0) // uses LoadConstant vreg 15 as uint index
         };
 
         string ptx = PtxEmitter.Emit(instructions);
 
-        Assert.Contains("mov.b32 %r60, %f1;", ptx);
-        Assert.Contains("shfl.sync.bfly.b32 %r61, %r60, 16, 0x1f, 0xffffffff;", ptx);
-        Assert.Contains("mov.b32 %f2, %r61;", ptx);
+        // ABI registers %r0..%r4 must NEVER be overwritten in the kernel instruction stream
+        string instructionStream = ptx[ptx.IndexOf("// Kernel Instruction Stream", StringComparison.Ordinal)..];
+        Assert.DoesNotContain("mov.u32 %r0,", instructionStream);
+        Assert.DoesNotContain("mov.u32 %r1,", instructionStream);
+        Assert.DoesNotContain("mov.u32 %r2,", instructionStream);
+        Assert.DoesNotContain("mov.u32 %r3,", instructionStream);
+        Assert.DoesNotContain("mov.u32 %r4,", instructionStream);
+
+        // Virtual registers 60/61 must NOT collide with ShflSyncBfly scratch registers (%r5/%r6)
+        Assert.Contains("shfl.sync.bfly.b32 %r6, %r5, 16, 0x1f, 0xffffffff;", ptx);
         Assert.Contains("bar.sync 0;", ptx);
-        Assert.Contains("mov.u32 %r5, %tid.x;", ptx);
-        Assert.Contains("mov.u32 %r6, %r5;", ptx);
-        Assert.Contains("ld.shared.f32 %f8, [%rd16];", ptx);
-        Assert.Contains("st.shared.f32 [%rd19], %f9;", ptx);
-        Assert.Contains("atom.global.add.f32 %f13, [%rd21], %f11;", ptx);
-        Assert.Contains("add.u64 %rd11, %rd2, %rd10;", ptx);
-        Assert.Contains("mov.f32 %f15, 0f40200000;", ptx);
+        Assert.Contains("ld.shared.f32", ptx);
+        Assert.Contains("st.shared.f32", ptx);
+        Assert.Contains("atom.global.add.f32", ptx);
+        Assert.Contains("cvt.rn.f32.u32", ptx);
+        Assert.Contains("0f40200000;", ptx);
+        Assert.Contains("0x40200000;", ptx);
+
+        // Clamped LoadGlobal(99) selects param_output (%rd2) rather than defaulting to %rd0
+        Assert.Matches(new Regex(@"add\.u64 %rd\d+, %rd2, %rd\d+;"), ptx);
+        Assert.Contains("smem_workspace[4096];", ptx);
+    }
+
+    [Fact]
+    public void PtxEmitter_ThrowsOnUnknownOpcode_AndInvalidMetadataArguments()
+    {
+        Assert.Throws<NotSupportedException>(() =>
+            PtxEmitter.Emit(new Instruction[] { new(999, 0, 0, 0) }));
+
+        Assert.Throws<NotSupportedException>(() =>
+            PtxEmitter.Emit(new Instruction[] { new(-1, 0, 0, 0) }));
+
+        // Invalid opcode even after Return must throw during pre-scan
+        Assert.Throws<NotSupportedException>(() =>
+            PtxEmitter.Emit(new Instruction[]
+            {
+                new((int)ComputeOpcode.Return, 0, 0, 0),
+                new(777, 0, 0, 0)
+            }));
+
+        Assert.Throws<ArgumentException>(() =>
+            PtxEmitter.Emit(ReadOnlySpan<Instruction>.Empty, " ", "sm_89"));
+
+        Assert.Throws<ArgumentException>(() =>
+            PtxEmitter.Emit(ReadOnlySpan<Instruction>.Empty, "k", " "));
     }
 
     [Fact]
@@ -134,11 +179,22 @@ public class PtxAssemblerTests
     }
 
     [Fact]
-    public void CudaDriver_DetectionSafe()
+    public void CudaDriver_AvailabilityAndGuardContracts()
     {
-        // Safe check without throwing even if no NVIDIA GPU is physically present
-        bool isAvailable = CudaDriver.IsAvailable;
-        // Should return a boolean without crashing
-        Assert.True(isAvailable || !isAvailable);
+        Assert.Equal(CuDriver.IsAvailable(), CudaDriver.IsAvailable);
+
+        Assert.Throws<ArgumentNullException>(() => CudaDriver.cuModuleLoadDataEx(out _, null!));
+        Assert.Throws<ArgumentNullException>(() => CudaDriver.cuModuleGetFunction(out _, IntPtr.Zero, null!));
+        Assert.Throws<ArgumentNullException>(() => CudaDriver.cuLaunchKernel(IntPtr.Zero, 1, 1, 1, 1, 1, 1, 0, IntPtr.Zero, null!));
+
+        if (!CudaDriver.IsAvailable)
+        {
+            Assert.Throws<PlatformNotSupportedException>(() => CudaDriver.cuInit(0));
+            return;
+        }
+
+        Assert.Equal(CUresult.CUDA_SUCCESS, CudaDriver.cuInit(0));
+        Assert.Equal(CUresult.CUDA_SUCCESS, CudaDriver.cuDeviceGet(out IntPtr dev0, 0));
+        Assert.True((int)dev0 >= 0);
     }
 }
