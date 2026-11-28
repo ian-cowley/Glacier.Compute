@@ -114,6 +114,7 @@ public static class Program
 
         using var slab = new SlabAllocator(slotsPerBin: 1024);
         using var buddy = new BuddyAllocator(64 * 1024 * 1024);
+        using var reservoir = new VirtualMemoryReservoir(256UL * 1024 * 1024);
         using var ring = new RingScratchWorkspace(64 * 1024 * 1024);
 
         // Warmup
@@ -125,6 +126,11 @@ public static class Program
             buddy.Free(p2);
             var p3 = ring.Allocate(4096);
             ring.Free(p3);
+        }
+        for (int i = 0; i < 100; i++)
+        {
+            var p4 = reservoir.Allocate(1024 * 1024);
+            reservoir.Free(p4);
         }
 
         const int allocIters = 50_000;
@@ -147,6 +153,17 @@ public static class Program
         sw.Stop();
         double buddyNs = sw.Elapsed.TotalNanoseconds / allocIters;
         Console.WriteLine($"  [Tier 2: Buddy Alloc + Merge] : {buddyNs:F2} ns / cycle (zero fragmentation)");
+
+        const int vmemIters = 2_000;
+        sw.Restart();
+        for (int i = 0; i < vmemIters; i++)
+        {
+            var p = reservoir.Allocate(1024 * 1024);
+            reservoir.Free(p);
+        }
+        sw.Stop();
+        double vmemUs = sw.Elapsed.TotalMicroseconds / vmemIters;
+        Console.WriteLine($"  [Tier 3: Virtual Commit/Free] : {vmemUs:F2} μs / 1 MB page cycle (zero-RSS idle)");
 
         sw.Restart();
         for (int i = 0; i < allocIters; i++)
