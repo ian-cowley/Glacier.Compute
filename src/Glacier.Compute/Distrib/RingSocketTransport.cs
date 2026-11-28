@@ -188,8 +188,17 @@ public sealed class RingSocketTransport : IRingTransport
     {
         if (Interlocked.Exchange(ref _disposed, 1) == 0)
         {
-            try { _successorSocket.Dispose(); } catch { }
-            try { _predecessorSocket.Dispose(); } catch { }
+            try { _successorSocket.Dispose(); }
+            catch (Exception ex) when (ex is ObjectDisposedException or System.Net.Sockets.SocketException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[RingSocketTransport] Successor socket dispose warning: {ex.Message}");
+            }
+
+            try { _predecessorSocket.Dispose(); }
+            catch (Exception ex) when (ex is ObjectDisposedException or System.Net.Sockets.SocketException)
+            {
+                System.Diagnostics.Trace.TraceWarning($"[RingSocketTransport] Predecessor socket dispose warning: {ex.Message}");
+            }
         }
     }
 }
